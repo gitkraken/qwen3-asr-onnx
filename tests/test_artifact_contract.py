@@ -242,3 +242,53 @@ def test_complete_int4_only_release_can_be_repackaged(tmp_path):
     for model in (tmp_path / "repeated").glob("*.onnx"):
         np.testing.assert_array_equal(_ort_result(model), _ort_result(source / model.name))
     assert (tmp_path / "repeated" / "embed_tokens.bin").read_bytes() == (source / "embed_tokens.bin").read_bytes()
+
+
+@pytest.mark.parametrize("name", ["config.json", "preprocessor_config.json", "tokenizer.json", "tokenizer_config.json"])
+@pytest.mark.parametrize("contents", ['{"truncated":', "[]"])
+def test_required_metadata_must_be_valid_json_objects(tmp_path, name, contents):
+    source = _release_input(tmp_path / "source")
+    (source / name).write_text(contents)
+    output = tmp_path / "release"
+    output.mkdir()
+    (output / "sentinel").write_text("previous release")
+    assert not pack.package(str(source), str(output))
+    assert (output / "sentinel").read_text() == "previous release"
+    assert not (tmp_path / "release.tar.gz").exists()
+
+
+@pytest.mark.parametrize("template_file", ["chat_template.jinja", "chat_template.json"])
+def test_packaged_chat_template_reloads_offline(tmp_path, template_file, monkeypatch):
+    from tokenizers import Tokenizer, models
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
+    from src.prompt import load_prompt_tokenizer
+    from tests.test_prompt_contract import OFFICIAL_CHAT_TEMPLATE
+
+    source = _release_input(tmp_path / "source")
+    raw = Tokenizer(models.WordLevel({"[UNK]": 0, "word": 1}, unk_token="[UNK]"))
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=raw, unk_token="[UNK]")
+    tokenizer.chat_template = OFFICIAL_CHAT_TEMPLATE
+    tokenizer.save_pretrained(source)
+    if template_file == "chat_template.json":
+        (source / "chat_template.jinja").unlink()
+        (source / template_file).write_text(json.dumps({"chat_template": OFFICIAL_CHAT_TEMPLATE}))
+    template_bytes = (source / template_file).read_bytes()
+    messages = [
+        {"role": "system", "content": "Kepler"},
+        {"role": "user", "content": [{"type": "audio", "audio": ""}]},
+    ]
+    expected = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    output = tmp_path / "release"
+    assert pack.package(str(source), str(output))
+    with tarfile.open(tmp_path / "release.tar.gz") as archive:
+        archive.extractall(tmp_path / "extracted", filter="data")
+    packaged = tmp_path / "extracted" / "release"
+    assert (packaged / template_file).read_bytes() == template_bytes
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+    offline = AutoTokenizer.from_pretrained(packaged, local_files_only=True)
+    if not offline.chat_template:
+        offline = load_prompt_tokenizer(str(packaged))
+    assert offline.chat_template == OFFICIAL_CHAT_TEMPLATE
+    assert offline.apply_chat_template(messages, add_generation_prompt=True, tokenize=False) == expected

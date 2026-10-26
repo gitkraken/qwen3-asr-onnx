@@ -16,7 +16,14 @@ from share_weights import external_data_files, share_external_models
 from src.embeddings import load_embed_tokens
 
 REQUIRED_METADATA = ["config.json", "preprocessor_config.json", "tokenizer.json", "tokenizer_config.json"]
-OPTIONAL_METADATA = ["added_tokens.json", "vocab.json", "merges.txt", "special_tokens_map.json"]
+OPTIONAL_METADATA = [
+    "added_tokens.json",
+    "vocab.json",
+    "merges.txt",
+    "special_tokens_map.json",
+    "chat_template.jinja",
+    "chat_template.json",
+]
 SHARED_FILES = REQUIRED_METADATA + OPTIONAL_METADATA
 
 
@@ -121,6 +128,11 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
     for name in REQUIRED_METADATA + ["embed_tokens.bin"]:
         if not (source / name).is_file():
             raise ValueError(f"Required artifact missing: {name}")
+    for name in REQUIRED_METADATA:
+        with (source / name).open() as stream:
+            metadata = json.load(stream)
+        if not isinstance(metadata, dict):
+            raise ValueError(f"Required metadata must be a JSON object: {name}")
     variants = [variant for variant in ("", "int4") if any((source / name).exists() for name in _graph_names(variant))]
     if not variants:
         raise ValueError("No model variants found")
