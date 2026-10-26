@@ -21,7 +21,7 @@ import os
 
 import onnx
 import torch
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel
 
 from src.decoder_wrapper import export_decoder_init, export_decoder_step
 from src.encoder_wrapper import export_encoder
@@ -34,6 +34,8 @@ from src.prompt import (
     EOS_TOKEN_IDS,
     IM_END_TOKEN_ID,
     IM_START_TOKEN_ID,
+    build_prompt_ids,
+    load_prompt_tokenizer,
 )
 
 
@@ -75,13 +77,13 @@ def load_model(model_id: str, device: str = "cpu", dtype=torch.float32):
 
 def copy_tokenizer(model_id: str, output_dir: str):
     """Copy tokenizer.json from the HuggingFace model."""
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    tokenizer = load_prompt_tokenizer(model_id)
 
     # Save tokenizer files
     tokenizer.save_pretrained(output_dir)
 
     # Remove unwanted files from save_pretrained, keep only tokenizer files
-    keep_files = {"tokenizer.json", "tokenizer_config.json"}
+    keep_files = {"tokenizer.json", "tokenizer_config.json", "chat_template.jinja"}
     remove_extensions = {".py", ".txt"}
     for f in os.listdir(output_dir):
         if f in keep_files:
@@ -101,7 +103,7 @@ def verify_special_tokens(model_id: str):
     Loads the tokenizer and checks that the token IDs we hardcoded
     in prompt.py match the actual tokenizer.
     """
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    tokenizer = load_prompt_tokenizer(model_id)
 
     checks = {
         "<|audio_start|>": AUDIO_START_TOKEN_ID,
@@ -110,6 +112,7 @@ def verify_special_tokens(model_id: str):
         "<|im_start|>": IM_START_TOKEN_ID,
         "<|im_end|>": IM_END_TOKEN_ID,
         "<|endoftext|>": ENDOFTEXT_TOKEN_ID,
+        "<asr_text>": ASR_TEXT_TOKEN_ID,
     }
 
     all_ok = True
@@ -123,7 +126,14 @@ def verify_special_tokens(model_id: str):
 
     if not all_ok:
         raise ValueError("Special token IDs do not match. Update src/prompt.py with correct values.")
-    print("All special token IDs verified.")
+    expected_text = (
+        "<|im_start|>system\n<|im_end|>\n"
+        "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+    if build_prompt_ids(1, tokenizer) != tokenizer.encode(expected_text, add_special_tokens=False):
+        raise ValueError("Chat template role names or structure do not match Qwen3-ASR")
+    print("All special token IDs and prompt roles verified.")
 
 
 def write_preprocessor_config(output_dir: str):
@@ -173,6 +183,8 @@ def write_config(model, output_dir: str):
 
     config = {
         "model_type": "qwen3_asr",
+        "embed_tokens_shape": list(model.thinker.model.embed_tokens.weight.shape),
+        "embed_tokens_dtype": "float32",
         "encoder": {
             "num_layers": audio_config.encoder_layers,
             "hidden_size": audio_config.d_model,

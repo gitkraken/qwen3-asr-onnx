@@ -72,16 +72,11 @@ def collect_calibration_data(
     decoder_init = ort.InferenceSession(os.path.join(model_dir, "decoder_init.onnx"), opts, providers=providers)
     decoder_step = ort.InferenceSession(os.path.join(model_dir, "decoder_step.onnx"), opts, providers=providers)
 
-    # Load embeddings
-    config_path = os.path.join(model_dir, "config.json")
-    with open(config_path) as f:
-        cfg = json.load(f)
-    dtype_str = cfg.get("embed_tokens_dtype", "float32")
-    shape = cfg["embed_tokens_shape"]
-    dtype = np.float16 if dtype_str == "float16" else np.float32
-    embed_tokens = (
-        np.fromfile(os.path.join(model_dir, "embed_tokens.bin"), dtype=dtype).reshape(shape).astype(np.float32)
-    )
+    from src.embeddings import load_embed_tokens
+    from src.prompt import load_prompt_tokenizer
+
+    embed_tokens = load_embed_tokens(model_dir)
+    tokenizer = load_prompt_tokenizer(model_dir)
 
     # Stream calibration audio
     ds = load_dataset(
@@ -125,7 +120,7 @@ def collect_calibration_data(
             if audio_token_count == 0:
                 continue
 
-            prompt_ids = build_prompt_ids(audio_token_count)
+            prompt_ids = build_prompt_ids(audio_token_count, tokenizer)
             input_embeds = embed_tokens[prompt_ids].copy()
             audio_start, audio_end = get_audio_pad_range(prompt_ids)
             input_embeds[audio_start:audio_end] = audio_features[0]
