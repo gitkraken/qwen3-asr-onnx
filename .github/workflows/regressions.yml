@@ -7,7 +7,7 @@ permissions:
 
 jobs:
   regression:
-    runs-on: macos-latest
+    runs-on: macos-15
     env:
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
@@ -18,6 +18,15 @@ jobs:
           version: "0.11.20"
           enable-cache: true
       - run: uv sync --locked --python 3.12.13
+      - name: Record and verify CPU platform
+        run: |
+          uv run --locked python - <<'PYTHON'
+          import platform
+          import torch
+          print(platform.platform(), platform.machine(), torch.__version__)
+          assert platform.machine() == "arm64"
+          assert not torch.cuda.is_available()
+          PYTHON
       - run: uv run --locked ruff check .
       - run: uv run --locked ruff format --check .
       - run: uv run --locked mypy .

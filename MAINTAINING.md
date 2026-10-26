@@ -39,7 +39,12 @@ uv run --locked pytest -q --strict-markers
 The default suite uses small official Qwen architectures with seeded weights,
 small ONNX graphs, synthetic embeddings and an attributed chat-template fixture.
 It runs without checkpoint downloads. CI runs the same suite with Hugging Face
-offline mode enabled. Legacy full-export tests and the explicit checkpoint suite
+offline mode enabled on the standard `macos-15` ARM64 CPU runner, whose architecture
+is listed in [GitHub's runner documentation](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job).
+The job records and asserts its architecture and CPU execution. This choice avoids
+Linux's default CUDA wheel dependency stack and matches the measured Apple Silicon
+environment. The universal lock contains Linux-specific CUDA dependencies; it does
+not establish numerical validation or a lightweight CPU installation on Linux. Legacy full-export tests and the explicit checkpoint suite
 carry the `integration` marker and are excluded by default. Missing full-model
 fixtures or skipped integration cases do not establish successful validation.
 
