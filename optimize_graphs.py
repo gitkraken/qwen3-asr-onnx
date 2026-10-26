@@ -27,7 +27,6 @@ import os
 import onnx
 from onnxruntime.transformers.optimizer import optimize_model
 
-
 PROTOBUF_LIMIT = 2 * 1024**3  # 2 GB
 
 
@@ -37,11 +36,13 @@ def load_config(model_dir: str) -> dict:
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"config.json not found in {model_dir}")
     with open(config_path) as f:
-        return json.load(f)
+        config = json.load(f)
+    if not isinstance(config, dict):
+        raise ValueError("config.json must contain an object")
+    return config
 
 
-def optimize_graph(onnx_path: str, num_heads: int, hidden_size: int,
-                   use_external_data: bool = True) -> None:
+def optimize_graph(onnx_path: str, num_heads: int, hidden_size: int, use_external_data: bool = True) -> None:
     """Run ORT transformer optimizer on a single ONNX file.
 
     Skips save if no fusions were applied (avoids unnecessary multi-GB rewrites).
@@ -79,8 +80,10 @@ def optimize_graph(onnx_path: str, num_heads: int, hidden_size: int,
     if not use_external_data:
         estimated_size = model.model.ByteSize()
         if estimated_size > PROTOBUF_LIMIT * 0.85:
-            print(f"  WARNING: Model size {estimated_size / 1024**3:.2f} GB "
-                  f"is close to 2 GB protobuf limit. Consider external data.")
+            print(
+                f"  WARNING: Model size {estimated_size / 1024**3:.2f} GB "
+                f"is close to 2 GB protobuf limit. Consider external data."
+            )
 
     # Save back (overwrites original)
     model.save_model_to_file(onnx_path, use_external_data_format=use_external_data)
@@ -130,7 +133,7 @@ def main():
             if os.path.exists(enc_path):
                 optimize_graph(enc_path, enc_heads, enc_hidden, use_external_data=False)
             else:
-                print(f"\nSkipping encoder.onnx (not found)")
+                print("\nSkipping encoder.onnx (not found)")
 
     # Optimize decoders (SimplifiedLayerNormalization fusion)
     if not args.skip_decoders:

@@ -1,0 +1,24 @@
+name: Exporter regressions
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: macos-latest
+    env:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.20"
+          enable-cache: true
+      - run: uv sync --locked --python 3.12.13
+      - run: uv run --locked ruff check .
+      - run: uv run --locked ruff format --check .
+      - run: uv run --locked mypy .
+      - run: uv run --locked pytest -q --strict-markers
