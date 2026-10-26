@@ -418,3 +418,34 @@ def test_standalone_archive_failure_preserves_prior_bytes(tmp_path, monkeypatch)
     monkeypatch.setattr(tarfile.TarFile, "add", interrupt)
     assert create_tar(archive, str(tmp_path)) is None
     assert destination.read_bytes() == b"retained archive"
+
+
+def test_package_rejects_graph_dependency_on_mutated_metadata(tmp_path):
+    source = _release_input(tmp_path / "source")
+    _write_model(source, "encoder.onnx", weight=np.ones((1, 1), dtype=np.float32))
+    model = onnx.load(source / "encoder.onnx")
+    tensor = model.graph.initializer[0]
+    tensor.ClearField("raw_data")
+    tensor.data_location = onnx.TensorProto.EXTERNAL
+    for key, value in (("location", "config.json"), ("offset", "0"), ("length", "4")):
+        entry = tensor.external_data.add()
+        entry.key = key
+        entry.value = value
+    onnx.save_model(model, source / "encoder.onnx")
+    output = tmp_path / "release"
+    output.mkdir()
+    (output / "sentinel").write_bytes(b"prior release")
+    assert not pack.package(str(source), str(output))
+    assert (output / "sentinel").read_bytes() == b"prior release"
+
+
+def test_package_rejects_encoder_dependency_on_decoder_canonical_data(tmp_path, capsys):
+    source = _release_input(tmp_path / "source")
+    _write_model(source, "encoder.onnx", external=True, data_name="decoder_weights.data")
+    output = tmp_path / "release"
+    output.mkdir()
+    (output / "sentinel").write_text("previous release")
+    assert not pack.package(str(source), str(output))
+    assert "destination conflict: decoder_weights.data" in capsys.readouterr().out
+    assert (output / "sentinel").read_text() == "previous release"
+    assert not (tmp_path / "release.tar.gz").exists()

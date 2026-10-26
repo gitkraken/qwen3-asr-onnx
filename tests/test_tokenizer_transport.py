@@ -290,13 +290,16 @@ def test_archive_materializes_linked_template_bytes(tmp_path):
 
 @pytest.mark.parametrize("script", ["quantize.py", "quantize_nbits.py"])
 @pytest.mark.parametrize("link", ["symlink", "hardlink"])
-def test_quantizer_cli_preserves_retained_tokenizer_links(tmp_path, script, link):
+@pytest.mark.parametrize("external_asset_dependency", [False, True])
+def test_quantizer_cli_preserves_retained_tokenizer_links(tmp_path, script, link, external_asset_dependency):
     source = _source(tmp_path / "source", "embedded")
     target = tmp_path / "target"
     target.mkdir()
     weight = np.ones((64, 64), dtype=np.float32) if script == "quantize_nbits.py" else None
     for name in ["decoder_init.onnx", "decoder_step.onnx"]:
         _write_model(source, name, external=False, weight=weight)
+    if external_asset_dependency:
+        _write_external_reference(source, "aux.onnx", "tokenizer_config.json")
     retained = tmp_path / "retained"
     retained.mkdir()
     before = {}
@@ -451,3 +454,140 @@ def test_local_tokenizer_metadata_cannot_execute_python(tmp_path):
     config_path.write_text(json.dumps(config))
     validate_tokenizer_assets(source)
     assert not marker.exists()
+
+
+def _write_external_reference(root, name, location):
+    tensor = numpy_helper.from_array(np.ones((1, 1), dtype=np.float32), "w")
+    tensor.ClearField("raw_data")
+    tensor.data_location = onnx.TensorProto.EXTERNAL
+    for key, value in (("location", location), ("offset", "0"), ("length", "4")):
+        entry = tensor.external_data.add()
+        entry.key = key
+        entry.value = value
+    graph = helper.make_graph(
+        [helper.make_node("MatMul", ["x", "w"], ["y"])],
+        "external-reference",
+        [helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 1])],
+        [helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 1])],
+        [tensor],
+    )
+    onnx.save_model(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=10), root / name)
+
+
+@pytest.mark.parametrize("script", ["quantize.py", "quantize_nbits.py"])
+def test_quantizer_rejects_graph_dependency_on_generated_output_before_writes(tmp_path, script):
+    source = _source(tmp_path / "source", "embedded")
+    suffix = "int8" if script == "quantize.py" else "int4"
+    reserved = f"decoder_init.{suffix}.onnx"
+    (source / reserved).write_bytes(b"source bytes claimed by auxiliary graph")
+    _write_external_reference(source, "aux.onnx", reserved)
+    if script == "quantize_nbits.py":
+        for name in ("decoder_init.onnx", "decoder_step.onnx"):
+            _write_model(source, name, weight=np.ones((64, 64), dtype=np.float32))
+        command = [
+            sys.executable,
+            str(ROOT / script),
+            "--input",
+            str(source),
+            "--output",
+            str(tmp_path / "target"),
+            "--bits",
+            "4",
+            "--block-size",
+            "32",
+        ]
+    else:
+        command = _converter_command(tmp_path, script, source, tmp_path / "target")
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=os.environ | {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
+    )
+    assert result.returncode != 0
+    assert "conflict" in (result.stdout + result.stderr).lower()
+    assert not (tmp_path / "target").exists()
+    assert (source / reserved).read_bytes() == b"source bytes claimed by auxiliary graph"
+
+
+@pytest.mark.parametrize("script", ["convert_fp16.py", "quantize_static.py"])
+def test_converter_rejects_encoder_dependency_on_generated_decoder_before_writes(tmp_path, script):
+    source = _source(tmp_path / "source", "embedded")
+    _write_external_reference(source, "encoder.onnx", "decoder_init.onnx")
+    target = tmp_path / "target"
+    command = _converter_command(tmp_path, script, source, target)
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=os.environ | {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
+    )
+    assert result.returncode != 0
+    assert "conflict" in (result.stdout + result.stderr).lower()
+    assert not target.exists()
+
+
+def test_inplace_quantizer_replaces_linked_config_without_mutating_retained_bytes(tmp_path):
+    source = _source(tmp_path / "source", "embedded")
+    retained = tmp_path / "retained.json"
+    (source / "config.json").replace(retained)
+    original = retained.read_bytes()
+    (source / "config.json").symlink_to(retained)
+    command = _converter_command(tmp_path, "quantize.py", source, source)
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=os.environ | {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert retained.read_bytes() == original
+    assert not (source / "config.json").is_symlink()
+    assert json.loads((source / "config.json").read_text())["quantization"]["decoder_init"] == "int8_dynamic"
+
+
+@pytest.mark.parametrize("script,suffix", [("quantize.py", "int8"), ("quantize_nbits.py", "int4")])
+@pytest.mark.parametrize("link", ["symlink", "hardlink"])
+def test_quantizer_rejects_linked_generated_graph_before_writes(tmp_path, script, suffix, link):
+    source = _source(tmp_path / "source", "embedded")
+    if script == "quantize_nbits.py":
+        for name in ("decoder_init.onnx", "decoder_step.onnx"):
+            _write_model(source, name, weight=np.ones((64, 64), dtype=np.float32))
+    target = tmp_path / "target"
+    target.mkdir()
+    retained = tmp_path / "retained.onnx"
+    retained.write_bytes(b"retained graph")
+    generated = target / f"decoder_init.{suffix}.onnx"
+    if link == "symlink":
+        generated.symlink_to(retained)
+    else:
+        os.link(retained, generated)
+    if script == "quantize.py":
+        command = _converter_command(tmp_path, script, source, target)
+    else:
+        command = [
+            sys.executable,
+            str(ROOT / script),
+            "--input",
+            str(source),
+            "--output",
+            str(target),
+            "--bits",
+            "4",
+            "--block-size",
+            "32",
+        ]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=os.environ | {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
+    )
+    assert result.returncode != 0
+    assert "destination conflict" in result.stdout + result.stderr
+    assert retained.read_bytes() == b"retained graph"
+    assert not (target / f"decoder_step.{suffix}.onnx").exists()

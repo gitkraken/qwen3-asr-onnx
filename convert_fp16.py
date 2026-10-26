@@ -17,12 +17,17 @@ Usage:
 import argparse
 import json
 import os
-import shutil
 
 import onnx
 from onnxconverter_common import convert_float_to_float16
 
-from share_weights import graph_file_closure, share_external_models
+from share_weights import (
+    copy_artifact_entry,
+    share_external_models,
+    transport_graph_files,
+    validate_generated_destinations,
+    write_artifact_json,
+)
 from src.tokenizer_assets import copy_tokenizer_assets, tokenizer_asset_names, validate_tokenizer_assets
 
 
@@ -79,6 +84,15 @@ def main():
     if tokenizer_asset_names(args.input):
         validate_tokenizer_assets(args.input)
 
+    converted = {name for name in args.files if os.path.isfile(os.path.join(args.input, name))}
+    generated = converted | {f"{name}.data" for name in converted}
+    if {"decoder_init.onnx", "decoder_step.onnx"} <= converted and not args.no_share_weights:
+        generated.add("decoder_weights.data")
+    files = {"embed_tokens.bin", "config.json"}
+    if os.path.isfile(os.path.join(args.input, "encoder.onnx")) and "encoder.onnx" not in converted:
+        files.update(transport_graph_files(args.input, ["encoder.onnx"], generated, {"config.json"}))
+    files.difference_update(tokenizer_asset_names(args.input))
+    validate_generated_destinations(args.output, generated)
     os.makedirs(args.output, exist_ok=True)
 
     print("Converting ONNX files to FP16...")
@@ -100,16 +114,12 @@ def main():
 
     # Copy non-converted files
     print("\nCopying supporting files...")
-    files = {"embed_tokens.bin", "config.json"}
-    if os.path.isfile(os.path.join(args.input, "encoder.onnx")):
-        files.update(graph_file_closure(args.input, ["encoder.onnx"]))
     for filename in sorted(files):
         src = os.path.join(args.input, filename)
         if os.path.exists(src):
             dst = os.path.join(args.output, filename)
             if not os.path.exists(dst):
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copy2(src, dst)
+                copy_artifact_entry(args.input, args.output, filename)
                 print(f"  Copied {filename}")
 
     if tokenizer_asset_names(args.input):
@@ -121,8 +131,7 @@ def main():
         with open(config_path) as f:
             config = json.load(f)
         config["decoder_dtype"] = "float16"
-        with open(config_path, "w") as f:
-            json.dump(config, f, indent=2)
+        write_artifact_json(args.output, "config.json", config)
         print("  Updated config.json with decoder_dtype=float16")
 
     print(f"\nConversion complete. Output: {args.output}")

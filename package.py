@@ -12,7 +12,7 @@ from pathlib import Path
 import onnx
 import onnxruntime as ort
 
-from share_weights import graph_file_closure, share_external_models
+from share_weights import graph_file_closure, share_external_models, transport_graph_files
 from src.embeddings import load_embed_tokens
 from src.tokenizer_assets import tokenizer_asset_names, validate_tokenizer_assets
 
@@ -126,6 +126,17 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
         if not (candidate == embed).all():
             raise ValueError("FP16 embedding sidecar disagrees with canonical data")
         embed = candidate
+    graph_files = transport_graph_files(
+        source,
+        (name for variant in variants for name in _graph_names(variant)),
+        rewritten={"config.json", "embed_tokens.bin"},
+    )
+    for variant in variants:
+        canonical = f"decoder_weights.{variant}.data" if variant else "decoder_weights.data"
+        unaffected_graphs = ["encoder" + (f".{variant}" if variant else "") + ".onnx"]
+        unaffected_graphs.extend(name for other in variants if other != variant for name in _graph_names(other))
+        if canonical in graph_file_closure(source, unaffected_graphs):
+            raise ValueError(f"ONNX transport destination conflict: {canonical}")
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".package-", dir=output.parent) as tmp:
         stage = Path(tmp)
@@ -133,8 +144,7 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
         release.mkdir()
         metadata = {"config.json", "preprocessor_config.json"} | tokenizer_asset_names(source)
         names = set(metadata)
-        for variant in variants:
-            names.update(graph_file_closure(source, _graph_names(variant)))
+        names.update(graph_files)
         for name in sorted(names):
             copy_file(source / name, release / name, hardlink=hardlink and name in metadata)
         embed.tofile(release / "embed_tokens.bin")

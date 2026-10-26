@@ -10,8 +10,10 @@ per-decoder data files are cleaned on retry, without deleting live references.
 
 import argparse
 import hashlib
+import json
 import math
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -124,6 +126,56 @@ def graph_file_closure(root, names):
         for path in external_data_files(root / name):
             files.add(path.relative_to(root).as_posix())
     return files
+
+
+def transport_graph_files(root, graphs, generated=(), rewritten=()):
+    graphs = set(graphs)
+    files = graph_file_closure(root, graphs)
+    conflicts = (files & set(generated)) | ((files - graphs) & set(rewritten))
+    if conflicts:
+        raise ValueError(f"ONNX transport destination conflict: {', '.join(sorted(conflicts))}")
+    return files
+
+
+def validate_generated_destinations(output, names):
+    root = Path(output).absolute()
+    if root.is_symlink():
+        raise ValueError(f"ONNX transport destination conflict: linked output directory {root}")
+    resolved_root = root.resolve()
+    for name in names:
+        destination = root / name
+        if not destination.parent.resolve().is_relative_to(resolved_root):
+            raise ValueError(f"ONNX transport destination conflict: {name}")
+        if destination.is_symlink() or (destination.exists() and destination.stat().st_nlink > 1):
+            raise ValueError(f"ONNX transport destination conflict: linked {name}")
+
+
+def copy_artifact_entry(source, output, name):
+    root = Path(output).resolve()
+    destination = Path(output) / name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not destination.parent.resolve().is_relative_to(root):
+        raise ValueError(f"Artifact destination escapes output directory: {name}")
+    with tempfile.NamedTemporaryFile(prefix=".artifact-", dir=destination.parent, delete=False) as temporary:
+        staged = Path(temporary.name)
+    try:
+        shutil.copy2(Path(source) / name, staged)
+        os.replace(staged, destination)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def write_artifact_json(output, name, value):
+    destination = Path(output) / name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", prefix=".artifact-", dir=destination.parent, delete=False) as temporary:
+        staged = Path(temporary.name)
+        json.dump(value, temporary, indent=2)
+    try:
+        staged.chmod(0o644)
+        os.replace(staged, destination)
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 def _tensor_chunks(tensor, root):

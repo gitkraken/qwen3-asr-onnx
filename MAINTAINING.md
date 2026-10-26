@@ -86,6 +86,13 @@ is an error. FP16 input is preserved when repackaged; FP32 conversion must remai
 finite. The raw binary is separate from ONNX session creation and needs its own
 validation.
 
+Converters, quantizers and packages transport each ONNX graph with its external-data
+closure. They reject dependencies that would be replaced by a generated graph or
+rewritten metadata before writing output. Decoder canonical data may be reused by
+its owning decoders; an encoder or another variant cannot claim that destination.
+Copied assets and rewritten configuration replace directory entries so an existing
+link cannot change retained bytes.
+
 Packages require complete graph sets plus their actual external-data references,
 configuration, tokenizer and embeddings. Inline, per-decoder and shared weights
 are alternatives. The release and archives are staged and validated before

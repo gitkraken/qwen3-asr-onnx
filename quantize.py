@@ -16,13 +16,17 @@ Usage (separate output dir):
 import argparse
 import json
 import os
-import shutil
 import tempfile
 
 import onnx
 from onnxruntime.quantization import QuantType, quantize_dynamic
 
-from share_weights import graph_file_closure
+from share_weights import (
+    copy_artifact_entry,
+    transport_graph_files,
+    validate_generated_destinations,
+    write_artifact_json,
+)
 from src.tokenizer_assets import (
     TOKENIZER_FILES,
     copy_tokenizer_assets,
@@ -136,6 +140,25 @@ def main():
     if tokenizer_asset_names(args.input):
         validate_tokenizer_assets(args.input)
 
+    suffix = f".{args.weight_type}"
+    files = {
+        fname
+        for fname in os.listdir(args.input)
+        if fname not in TOKENIZER_FILES and suffix not in fname and os.path.isfile(os.path.join(args.input, fname))
+    }
+    generated_graphs = {
+        f"{name.removesuffix('.onnx')}{suffix}.onnx"
+        for name in ONNX_FILES
+        if os.path.isfile(os.path.join(args.input, name))
+    }
+    generated = generated_graphs | {f"{name}.data" for name in generated_graphs}
+    files.update(
+        transport_graph_files(
+            args.input, (name for name in files if name.endswith(".onnx")), generated, {"config.json"}
+        )
+    )
+    files.difference_update(TOKENIZER_FILES)
+    validate_generated_destinations(args.output, generated)
     os.makedirs(args.output, exist_ok=True)
 
     # Parse weight type
@@ -197,17 +220,8 @@ def main():
     # Copy non-quantized files (skip if input == output)
     if os.path.realpath(args.input) != os.path.realpath(args.output):
         print("\nCopying non-quantized files...")
-        files = {
-            fname
-            for fname in os.listdir(args.input)
-            if fname not in TOKENIZER_FILES and suffix not in fname and os.path.isfile(os.path.join(args.input, fname))
-        }
-        files.update(graph_file_closure(args.input, (fname for fname in files if fname.endswith(".onnx"))))
         for fname in sorted(files):
-            src = os.path.join(args.input, fname)
-            dst = os.path.join(args.output, fname)
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(src, dst)
+            copy_artifact_entry(args.input, args.output, fname)
             print(f"  Copied {fname}")
 
     if tokenizer_asset_names(args.input):
@@ -228,8 +242,7 @@ def main():
     for name in ["encoder", "decoder_init", "decoder_step"]:
         quant_info[name] = f"{args.weight_type}_dynamic"
     config["quantization"] = quant_info
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
+    write_artifact_json(args.output, "config.json", config)
     print("  Updated config.json with quantization metadata")
 
     # Summary

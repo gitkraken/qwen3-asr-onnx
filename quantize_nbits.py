@@ -49,7 +49,15 @@ from onnxruntime.quantization.matmul_nbits_quantizer import (
 )
 from onnxruntime.quantization.quant_utils import QuantFormat
 
-from share_weights import external_data_files, get_external_info, graph_file_closure, model_tensors
+from share_weights import (
+    copy_artifact_entry,
+    external_data_files,
+    get_external_info,
+    model_tensors,
+    transport_graph_files,
+    validate_generated_destinations,
+    write_artifact_json,
+)
 from src.tokenizer_assets import (
     TOKENIZER_FILES,
     copy_tokenizer_assets,
@@ -260,10 +268,26 @@ def main():
     if tokenizer_asset_names(args.input):
         validate_tokenizer_assets(args.input)
 
+    bits_suffix = f".int{args.bits}"
+    files = {
+        fname
+        for fname in os.listdir(args.input)
+        if fname not in TOKENIZER_FILES
+        and not any(fname.startswith(f"{name}{bits_suffix}") for name in ("decoder_init", "decoder_step"))
+        and os.path.isfile(os.path.join(args.input, fname))
+    }
+    generated_graphs = {f"{name}{bits_suffix}.onnx" for name in args.decoders}
+    generated = generated_graphs | {f"{name}.data" for name in generated_graphs}
+    files.update(
+        transport_graph_files(
+            args.input, (name for name in files if name.endswith(".onnx")), generated, {"config.json"}
+        )
+    )
+    files.difference_update(TOKENIZER_FILES)
+    validate_generated_destinations(args.output, generated)
     os.makedirs(args.output, exist_ok=True)
 
     # Quantize each decoder file
-    bits_suffix = f".int{args.bits}"
     quantized_names = set()
     for name in args.decoders:
         src = os.path.join(args.input, f"{name}.onnx")
@@ -276,19 +300,8 @@ def main():
     # Copy non-quantized files from input to output (encoder, tokenizer, config, etc.)
     # Skip if input == output (in-place quantization).
     if os.path.realpath(args.input) != os.path.realpath(args.output):
-        files = {
-            fname
-            for fname in os.listdir(args.input)
-            if fname not in TOKENIZER_FILES
-            and not any(fname.startswith(f"{n}{bits_suffix}") for n in ("decoder_init", "decoder_step"))
-            and os.path.isfile(os.path.join(args.input, fname))
-        }
-        files.update(graph_file_closure(args.input, (fname for fname in files if fname.endswith(".onnx"))))
         for fname in sorted(files):
-            src = os.path.join(args.input, fname)
-            dst = os.path.join(args.output, fname)
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(src, dst)
+            copy_artifact_entry(args.input, args.output, fname)
             print(f"  Copied {fname}")
 
     if tokenizer_asset_names(args.input):
@@ -309,8 +322,7 @@ def main():
             quant_info[name] = tag
         cfg["quantization"] = quant_info
 
-        with open(config_path, "w") as f:
-            json.dump(cfg, f, indent=2)
+        write_artifact_json(args.output, "config.json", cfg)
         print(f"  Updated config.json: quantization={json.dumps(quant_info)}")
 
     # Report sizes

@@ -24,7 +24,6 @@ import argparse
 import io
 import json
 import os
-import shutil
 import time
 
 import numpy as np
@@ -39,7 +38,13 @@ from onnxruntime.quantization import (
     quantize_static,
 )
 
-from share_weights import graph_file_closure, share_external_models
+from share_weights import (
+    copy_artifact_entry,
+    share_external_models,
+    transport_graph_files,
+    validate_generated_destinations,
+    write_artifact_json,
+)
 from src.tokenizer_assets import copy_tokenizer_assets, tokenizer_asset_names, validate_tokenizer_assets
 
 # ---------------------------------------------------------------------------
@@ -327,6 +332,19 @@ def main():
     if tokenizer_asset_names(args.input):
         validate_tokenizer_assets(args.input)
 
+    converted = {
+        f"{stem}.onnx"
+        for stem in ("decoder_init", "decoder_step")
+        if os.path.isfile(os.path.join(args.input, f"{stem}.onnx"))
+    }
+    generated = converted | {f"{name}.data" for name in converted}
+    if len(converted) == 2 and not args.no_share_weights:
+        generated.add("decoder_weights.data")
+    files = {"embed_tokens.bin", "config.json"}
+    if os.path.isfile(os.path.join(args.input, "encoder.onnx")):
+        files.update(transport_graph_files(args.input, ["encoder.onnx"], generated, {"config.json"}))
+    files.difference_update(tokenizer_asset_names(args.input))
+    validate_generated_destinations(args.output, generated)
     os.makedirs(args.output, exist_ok=True)
 
     method_map = {
@@ -412,16 +430,12 @@ def main():
 
     # Copy encoder and supporting files from input
     print("\nCopying supporting files...")
-    files = {"embed_tokens.bin", "config.json"}
-    if os.path.isfile(os.path.join(args.input, "encoder.onnx")):
-        files.update(graph_file_closure(args.input, ["encoder.onnx"]))
     for filename in sorted(files):
         src = os.path.join(args.input, filename)
         if os.path.exists(src):
             dst = os.path.join(args.output, filename)
             if not os.path.exists(dst):
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copy2(src, dst)
+                copy_artifact_entry(args.input, args.output, filename)
                 print(f"  Copied {filename}")
 
     if tokenizer_asset_names(args.input):
@@ -435,8 +449,7 @@ def main():
         config["quantization"] = "int8_static"
         config["calibration_method"] = args.calibrate_method
         config["calibration_samples"] = args.n_samples
-        with open(config_path, "w") as f:
-            json.dump(config, f, indent=2)
+        write_artifact_json(args.output, "config.json", config)
 
     print(f"\nStatic quantization complete. Output: {args.output}")
     total = 0
