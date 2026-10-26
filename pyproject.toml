@@ -27,6 +27,12 @@ package = false
 [tool.pytest.ini_options]
 addopts = "-m 'not integration'"
 testpaths = ["tests"]
+filterwarnings = [
+    "error",
+    "ignore:You are using the legacy TorchScript-based ONNX export:DeprecationWarning",
+    "ignore:The feature will be removed.*:DeprecationWarning:torch.onnx._internal.torchscript_exporter.utils",
+    "ignore:invalid escape sequence:SyntaxWarning",
+]
 markers = [
     "slow: long-running model test",
     "integration: requires full original checkpoints or exported model artifacts",
