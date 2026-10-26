@@ -130,7 +130,8 @@ Successful conventional decoder exports retain the two graph files and canonical
 shared data file. Unreferenced conventional per-decoder data is cleaned on retry after checking
 nested graph references. Sharing stages in a sibling directory so abrupt process
 exit cannot contaminate the model inventory or leave directories in the canonical
-triplet handed to Kepler. A terminated process can leave that sibling behind;
+triplet handed to Kepler. The model directory must have a writable parent on the
+same filesystem for staging and atomic replacement. A terminated process can leave that sibling behind;
 only remove it after establishing ownership. Historical unmarked staging inside
 a model directory is preserved and inventoried like other foreign content;
 invalid references produce an actionable error before publication. Arbitrary data

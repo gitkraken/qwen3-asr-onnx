@@ -130,18 +130,21 @@ def test_truncated_external_dependency_preserves_output(tmp_path):
 def test_archive_failure_preserves_previous_release(tmp_path, monkeypatch):
     source = _release_input(tmp_path / "source")
     output = tmp_path / "release"
-    output.mkdir()
-    (output / "sentinel").write_text("old")
+    assert pack.package(source, output)
     archive = tmp_path / "release.tar.gz"
-    archive.write_bytes(b"old archive")
+    archive_bytes = archive.read_bytes()
+    previous = {p.relative_to(output): p.read_bytes() for p in output.rglob("*") if p.is_file()}
+    reached = []
 
-    def fail(*args, **kwargs):
+    def fail(root, target, names, archive_root):
+        reached.append(archive_root)
         raise OSError("injected archive failure")
 
-    monkeypatch.setattr(tarfile, "open", fail)
+    monkeypatch.setattr(pack, "_create_archive", fail)
     assert not pack.package(str(source), str(output))
-    assert (output / "sentinel").read_text() == "old"
-    assert archive.read_bytes() == b"old archive"
+    assert reached == ["release"]
+    assert {p.relative_to(output): p.read_bytes() for p in output.rglob("*") if p.is_file()} == previous
+    assert archive.read_bytes() == archive_bytes
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float16"])
@@ -305,8 +308,13 @@ def test_publication_destinations_cannot_overlap_source(tmp_path, source_name):
 
 
 @pytest.mark.parametrize("problem", ["missing-template", "invalid-template", "invalid-tokenizer"])
-def test_unusable_tokenizer_contract_preserves_previous_release(tmp_path, problem):
+def test_unusable_tokenizer_contract_preserves_previous_release(tmp_path, problem, monkeypatch):
     source = _release_input(tmp_path / "source")
+    output = tmp_path / "release"
+    assert pack.package(source, output)
+    archive = tmp_path / "release.tar.gz"
+    archive_bytes = archive.read_bytes()
+    previous = {p.relative_to(output): p.read_bytes() for p in output.rglob("*") if p.is_file()}
     if problem == "missing-template":
         for name in ("chat_template.jinja", "chat_template.json"):
             (source / name).unlink(missing_ok=True)
@@ -317,14 +325,18 @@ def test_unusable_tokenizer_contract_preserves_previous_release(tmp_path, proble
         (source / "chat_template.jinja").write_text("{{ messages[0].content }}")
     else:
         (source / "tokenizer.json").write_text("{}")
-    output = tmp_path / "release"
-    output.mkdir()
-    (output / "sentinel").write_text("old release")
-    archive = tmp_path / "release.tar.gz"
-    archive.write_bytes(b"old archive")
+    validate = pack.validate_tokenizer_assets
+    reached = []
+
+    def validate_and_record(root):
+        reached.append(Path(root).name)
+        return validate(root)
+
+    monkeypatch.setattr(pack, "validate_tokenizer_assets", validate_and_record)
     assert not pack.package(str(source), str(output))
-    assert (output / "sentinel").read_text() == "old release"
-    assert archive.read_bytes() == b"old archive"
+    assert reached == ["release"]
+    assert {p.relative_to(output): p.read_bytes() for p in output.rglob("*") if p.is_file()} == previous
+    assert archive.read_bytes() == archive_bytes
 
 
 def _symlink_metadata_to_cache(source, cache):
