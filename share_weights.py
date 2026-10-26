@@ -1,376 +1,259 @@
 #!/usr/bin/env python3
-"""
-Share external weight data between split decoder models (decoder_init + decoder_step).
+"""Share decoder data without invalidating the source models during publication.
 
-After torch.onnx.export() exports both wrappers independently, each gets its own
-copy of the model weights. This script rewrites decoder_step.onnx to reference
-decoder_init's external data file, eliminating the duplicate.
-
-Algorithm:
-    1. Load both ONNX protos without external tensor data
-    2. Hash each initializer's data from their respective .data files
-    3. For matched tensors: redirect step's external_data to init's file/offset
-    4. For unmatched tensors (small constants): inline into the proto
-    5. Rename init's data file -> decoder_weights.data
-    6. Update init's references, save both protos, delete step's data file
-
-Usage:
-    python share_weights.py output/qwen3-asr-0.6b
-    python share_weights.py output/qwen3-asr-0.6b-int8
-    python share_weights.py output/qwen3-asr-0.6b --also-int8
+Data and both graphs are validated in staging. The canonical data file is
+published before either graph, and source data is retained until both graphs
+have been replaced. Individual replacements are atomic; the group is not.
+An interrupted run can retain an unreferenced custom data file. Conventional
+per-decoder data files are cleaned on retry, without deleting live references.
 """
 
 import argparse
 import hashlib
-import mmap
+import math
 import os
+import tempfile
+from pathlib import Path
 
 import onnx
+from google.protobuf.descriptor import FieldDescriptor
 
 SHARED_DATA_NAME = "decoder_weights.data"
+_CHUNK_BYTES = 8 * 1024 * 1024
 
 
 def _shared_data_name(suffix=None):
-    """Shared data filename, optionally with quantization suffix."""
-    if suffix:
-        return f"decoder_weights.{suffix}.data"
-    return SHARED_DATA_NAME
+    return f"decoder_weights.{suffix}.data" if suffix else SHARED_DATA_NAME
 
 
 def _decoder_filenames(suffix=None):
-    """Return (init_onnx, step_onnx) filenames with optional suffix."""
-    if suffix:
-        return f"decoder_init.{suffix}.onnx", f"decoder_step.{suffix}.onnx"
-    return "decoder_init.onnx", "decoder_step.onnx"
+    tag = f".{suffix}" if suffix else ""
+    return f"decoder_init{tag}.onnx", f"decoder_step{tag}.onnx"
+
+
+def model_tensors(message):
+    if isinstance(message, onnx.TensorProto):
+        yield message
+        return
+    for field, value in message.ListFields():
+        if field.type != FieldDescriptor.TYPE_MESSAGE:
+            continue
+        if field.is_repeated:
+            for item in value:
+                yield from model_tensors(item)
+        else:
+            yield from model_tensors(value)
 
 
 def get_external_info(tensor):
-    """Extract external data location from a tensor proto."""
-    info = {}
-    for entry in tensor.external_data:
-        info[entry.key] = entry.value
-    return info
+    return {entry.key: entry.value for entry in tensor.external_data}
+
+
+def _external_range(root, tensor):
+    info = get_external_info(tensor)
+    location = info.get("location", "")
+    if not location or "\\" in location or Path(location).is_absolute():
+        raise ValueError(f"Invalid external data location: {location!r}")
+    root = Path(root).resolve()
+    if ".." in Path(location).parts:
+        raise ValueError(f"Invalid external data location: {location!r}")
+    path = root / location
+    if path.resolve() != path or not path.is_file():
+        raise ValueError(f"External data missing or outside model directory: {location}")
+    size = path.stat().st_size
+    offset = int(info.get("offset", "0"))
+    length = int(info.get("length", str(size - offset)))
+    if offset < 0 or length < 0 or offset + length > size:
+        raise ValueError(f"Invalid external data range for {tensor.name}")
+    dtype_name = onnx.TensorProto.DataType.Name(tensor.data_type)
+    if dtype_name == "STRING":
+        raise ValueError("External string tensors are unsupported")
+    if dtype_name in ("INT4", "UINT4", "FLOAT4E2M1"):
+        bits = 4
+    elif dtype_name in ("INT2", "UINT2"):
+        bits = 2
+    else:
+        bits = onnx.helper.tensor_dtype_to_np_dtype(tensor.data_type).itemsize * 8
+    expected = (math.prod(tensor.dims) * bits + 7) // 8
+    if length != expected:
+        raise ValueError(f"External tensor {tensor.name} has {length} bytes; expected {expected}")
+    return path, offset, length
+
+
+def external_data_files(model_path):
+    path = Path(model_path).resolve()
+    model = onnx.load(path, load_external_data=False)
+    return {
+        _external_range(path.parent, tensor)[0]
+        for tensor in model_tensors(model)
+        if tensor.data_location == onnx.TensorProto.EXTERNAL
+    }
+
+
+def _tensor_chunks(tensor, root):
+    if tensor.data_location != onnx.TensorProto.EXTERNAL:
+        yield tensor.raw_data
+        return
+    path, offset, remaining = _external_range(root, tensor)
+    with path.open("rb") as stream:
+        stream.seek(offset)
+        while remaining:
+            chunk = stream.read(min(remaining, _CHUNK_BYTES))
+            if not chunk:
+                raise ValueError(f"Unexpected end of data for {tensor.name}")
+            remaining -= len(chunk)
+            yield chunk
 
 
 def set_tensor_external(tensor, location, offset, length):
-    """Set external data references on a tensor."""
-    del tensor.external_data[:]
+    tensor.ClearField("raw_data")
+    tensor.ClearField("external_data")
     tensor.data_location = onnx.TensorProto.EXTERNAL
-    for key, value in [
-        ("location", location),
-        ("offset", str(offset)),
-        ("length", str(length)),
-    ]:
+    for key, value in (("location", location), ("offset", str(offset)), ("length", str(length))):
         entry = tensor.external_data.add()
         entry.key = key
         entry.value = value
 
 
-def inline_tensor(tensor, data):
-    """Convert an external tensor to inline raw_data."""
-    del tensor.external_data[:]
-    tensor.data_location = onnx.TensorProto.DEFAULT
-    tensor.raw_data = bytes(data)
-
-
-def hash_data(mm, offset, length):
-    """Compute SHA-256 of a region in a memory-mapped file."""
-    return hashlib.sha256(mm[offset : offset + length]).hexdigest()
-
-
-def build_init_index(init_model, data_mm):
-    """Build {sha256: (tensor_name, offset, length)} from init model's external tensors."""
+def _write_shared_data(models, root, path):
     index = {}
-    for tensor in init_model.graph.initializer:
-        if not tensor.external_data:
-            continue
-        info = get_external_info(tensor)
-        offset = int(info.get("offset", "0"))
-        length = int(info["length"])
-        h = hash_data(data_mm, offset, length)
-        index[h] = (tensor.name, offset, length)
-    return index
+    with path.open("wb") as stream:
+        for model in models:
+            for tensor in model_tensors(model):
+                if tensor.data_location != onnx.TensorProto.EXTERNAL and not tensor.raw_data:
+                    continue
+                digest = hashlib.sha256()
+                length = 0
+                for chunk in _tensor_chunks(tensor, root):
+                    digest.update(chunk)
+                    length += len(chunk)
+                key = (tensor.data_type, tuple(tensor.dims), length, digest.digest())
+                if key not in index:
+                    index[key] = stream.tell()
+                    for chunk in _tensor_chunks(tensor, root):
+                        stream.write(chunk)
+                set_tensor_external(tensor, path.name, index[key], length)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _file_digest(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").digest()
+
+
+def _live_data_files(root):
+    live = set()
+    for path in root.glob("*.onnx"):
+        live.update(external_data_files(path))
+    return live
+
+
+def _publish_data(staged, target, root):
+    if target.exists():
+        identical = staged.stat().st_size == target.stat().st_size and _file_digest(staged) == _file_digest(target)
+        if identical:
+            return
+        if target in _live_data_files(root):
+            raise ValueError(
+                "Canonical shared data is in use with incompatible bytes; rebuild in a clean output directory"
+            )
+    os.replace(staged, target)
+
+
+def _cleanup_data(root, names, old_files, shared_name):
+    candidates = old_files | {root / f"{name}.data" for name in names}
+    live = _live_data_files(root)
+    for path in candidates - live - {root / shared_name}:
+        if path.exists():
+            path.unlink()
+
+
+def _validate_models(root, names):
+    for name in names:
+        external_data_files(root / name)
+        onnx.checker.check_model(str(root / name))
 
 
 def share_external_models(model_dir, suffix=None):
-    """Share weights when both models have external .data files."""
-    init_name, step_name = _decoder_filenames(suffix)
+    root = Path(model_dir).resolve()
+    names = _decoder_filenames(suffix)
+    if not all((root / name).is_file() for name in names):
+        raise FileNotFoundError(f"Both split decoder models are required in {root}")
+    models = [onnx.load(root / name, load_external_data=False) for name in names]
+    old_files = set().union(*(external_data_files(root / name) for name in names))
     shared_name = _shared_data_name(suffix)
-    init_proto_path = os.path.join(model_dir, init_name)
-    step_proto_path = os.path.join(model_dir, step_name)
-    init_data_path = init_proto_path + ".data"
-    step_data_path = step_proto_path + ".data"
-    shared_data_path = os.path.join(model_dir, shared_name)
-
-    # Check preconditions
-    if not os.path.exists(init_proto_path) or not os.path.exists(step_proto_path):
-        print(f"  Split decoder not found in {model_dir}, skipping")
-        return False
-
-    if os.path.exists(shared_data_path) and not os.path.exists(step_data_path):
-        print(f"  Already shared in {model_dir}")
+    _validate_models(root, names)
+    already_shared = old_files == {root / shared_name} and all(
+        not tensor.raw_data for model in models for tensor in model_tensors(model)
+    )
+    if already_shared:
+        _cleanup_data(root, names, old_files, shared_name)
         return True
-
-    if not os.path.exists(init_data_path) or not os.path.exists(step_data_path):
-        print("  External data files missing — trying inline path")
-        return share_inline_models(model_dir, suffix=suffix)
-
-    step_data_size = os.path.getsize(step_data_path)
-    init_data_size = os.path.getsize(init_data_path)
-
-    print("  Loading protos (no external data)...")
-    init_model = onnx.load(init_proto_path, load_external_data=False)
-    step_model = onnx.load(step_proto_path, load_external_data=False)
-
-    # Build init hash index
-    print(f"  Indexing init weights ({init_data_size / 1e9:.2f} GB)...")
-    with open(init_data_path, "rb") as f:
-        init_mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-        init_index = build_init_index(init_model, init_mm)
-        init_mm.close()
-
-    print(f"  Indexed {len(init_index)} init tensors")
-
-    # Match step tensors against init index
-    print(f"  Matching step weights ({step_data_size / 1e9:.2f} GB)...")
-    matched = 0
-    inlined = 0
-    matched_bytes = 0
-
-    with open(step_data_path, "rb") as f:
-        step_mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-
-        for tensor in step_model.graph.initializer:
-            if not tensor.external_data:
-                continue
-
-            info = get_external_info(tensor)
-            offset = int(info.get("offset", "0"))
-            length = int(info["length"])
-            h = hash_data(step_mm, offset, length)
-
-            if h in init_index:
-                init_tname, init_offset, init_length = init_index[h]
-                set_tensor_external(tensor, shared_name, init_offset, init_length)
-                matched += 1
-                matched_bytes += length
-            else:
-                # Unmatched: inline into proto (these are small constants)
-                data = step_mm[offset : offset + length]
-                inline_tensor(tensor, data)
-                inlined += 1
-
-        step_mm.close()
-
-    # Update init model's external_data location references
-    for tensor in init_model.graph.initializer:
-        if not tensor.external_data:
-            continue
-        for entry in tensor.external_data:
-            if entry.key == "location":
-                entry.value = shared_name
-
-    # Rename init data file -> shared
-    print(f"  Renaming {os.path.basename(init_data_path)} -> {shared_name}")
-    os.rename(init_data_path, shared_data_path)
-
-    # Save both protos
-    print("  Saving updated protos...")
-    with open(init_proto_path, "wb") as f:
-        f.write(init_model.SerializeToString())
-    with open(step_proto_path, "wb") as f:
-        f.write(step_model.SerializeToString())
-
-    # Delete step data file
-    os.remove(step_data_path)
-
-    # Report
-    init_proto_size = os.path.getsize(init_proto_path)
-    step_proto_size = os.path.getsize(step_proto_path)
-    shared_size = os.path.getsize(shared_data_path)
-
-    print("\n  Results:")
-    print(f"    Matched:  {matched} tensors ({matched_bytes / 1e9:.2f} GB)")
-    print(f"    Inlined:  {inlined} tensors (small constants)")
-    print(f"    Shared data:  {shared_size / 1e9:.2f} GB ({shared_name})")
-    print(f"    Init proto:   {init_proto_size / 1e6:.1f} MB")
-    print(f"    Step proto:   {step_proto_size / 1e6:.1f} MB")
-    print(f"    Saved:        {step_data_size / 1e9:.2f} GB")
+    with tempfile.TemporaryDirectory(prefix=".share-", dir=root) as tmp:
+        stage = Path(tmp)
+        _write_shared_data(models, root, stage / shared_name)
+        for model, name in zip(models, names):
+            with open(stage / name, "wb") as stream:
+                stream.write(model.SerializeToString())
+                stream.flush()
+                os.fsync(stream.fileno())
+        _validate_models(stage, names)
+        _publish_data(stage / shared_name, root / shared_name, root)
+        for name in names:
+            os.replace(stage / name, root / name)
+        _validate_models(root, names)
+        _cleanup_data(root, names, old_files, shared_name)
     return True
 
 
 def share_inline_models(model_dir, suffix=None):
-    """Share weights when models have inline data (no .data files)."""
-    init_name, step_name = _decoder_filenames(suffix)
-    shared_name = _shared_data_name(suffix)
-    init_proto_path = os.path.join(model_dir, init_name)
-    step_proto_path = os.path.join(model_dir, step_name)
-    shared_data_path = os.path.join(model_dir, shared_name)
-
-    print("  Loading init model with inline data...")
-    init_model = onnx.load(init_proto_path)
-
-    # Convert init to external data format
-    print("  Converting init to external data format...")
-    onnx.external_data_helper.convert_model_to_external_data(
-        init_model,
-        all_tensors_to_one_file=True,
-        location=shared_name,
-        size_threshold=1024,
-        convert_attribute=False,
-    )
-
-    # Save init (writes shared data file)
-    print("  Saving init with external data...")
-    onnx.save(init_model, init_proto_path)
-
-    # Reload init proto to get offsets
-    init_model = onnx.load(init_proto_path, load_external_data=False)
-
-    # Build init hash index from the new shared data file
-    print("  Indexing init weights...")
-    with open(shared_data_path, "rb") as f:
-        init_mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-        init_index = build_init_index(init_model, init_mm)
-        init_mm.close()
-
-    # Load step model with full data
-    print("  Loading step model with inline data...")
-    step_model = onnx.load(step_proto_path)
-
-    # Match step tensors against init
-    matched = 0
-    inlined_kept = 0
-    matched_bytes = 0
-
-    for tensor in step_model.graph.initializer:
-        if tensor.raw_data and len(tensor.raw_data) >= 1024:
-            h = hashlib.sha256(tensor.raw_data).hexdigest()
-            if h in init_index:
-                init_name, init_offset, init_length = init_index[h]
-                matched_bytes += len(tensor.raw_data)
-                tensor.raw_data = b""
-                set_tensor_external(tensor, shared_name, init_offset, init_length)
-                matched += 1
-            else:
-                inlined_kept += 1
-        else:
-            inlined_kept += 1
-
-    # Save step proto only (no data file written)
-    print("  Saving step proto...")
-    with open(step_proto_path, "wb") as f:
-        f.write(step_model.SerializeToString())
-
-    # Clean up step's old data file if it exists
-    step_data_path = step_proto_path + ".data"
-    if os.path.exists(step_data_path):
-        os.remove(step_data_path)
-
-    # Report
-    init_proto_size = os.path.getsize(init_proto_path)
-    step_proto_size = os.path.getsize(step_proto_path)
-    shared_size = os.path.getsize(shared_data_path)
-
-    print("\n  Results:")
-    print(f"    Matched:  {matched} tensors ({matched_bytes / 1e9:.2f} GB)")
-    print(f"    Kept inline:  {inlined_kept} tensors")
-    print(f"    Shared data:  {shared_size / 1e9:.2f} GB ({shared_name})")
-    print(f"    Init proto:   {init_proto_size / 1e6:.1f} MB")
-    print(f"    Step proto:   {step_proto_size / 1e6:.1f} MB")
-    return True
+    return share_external_models(model_dir, suffix=suffix)
 
 
 def verify_model(model_dir, filename):
-    """Run onnx.checker on a model."""
-    path = os.path.join(model_dir, filename)
-    if not os.path.exists(path):
-        return
     try:
-        # Use path-based check to avoid 2 GiB protobuf limit
-        onnx.checker.check_model(path)
-        print(f"    {filename}: OK")
-    except Exception as e:
-        print(f"    {filename}: FAILED — {e}")
+        _validate_models(Path(model_dir), [filename])
+        return True
+    except Exception as error:
+        print(f"{filename}: FAILED: {error}")
         return False
-    return True
 
 
 def verify_inference(model_dir, suffix=None):
-    """Load both models in ORT and run a dummy forward pass."""
-    try:
-        import onnxruntime as ort
-    except ImportError:
-        print("  onnxruntime not available, skipping inference check")
-        return True
-
-    init_name, step_name = _decoder_filenames(suffix)
-    init_path = os.path.join(model_dir, init_name)
-    step_path = os.path.join(model_dir, step_name)
+    import onnxruntime as ort
 
     opts = ort.SessionOptions()
-    opts.log_severity_level = 3  # suppress warnings
-
+    opts.log_severity_level = 3
     try:
-        print(f"  Loading {init_name} in ORT...")
-        ort.InferenceSession(init_path, opts)
-        print(f"  Loading {step_name} in ORT...")
-        ort.InferenceSession(step_path, opts)
-        print("  Both sessions loaded successfully")
+        for name in _decoder_filenames(suffix):
+            ort.InferenceSession(str(Path(model_dir) / name), opts, providers=["CPUExecutionProvider"])
         return True
-    except Exception as e:
-        print(f"  ORT load FAILED: {e}")
+    except Exception as error:
+        print(f"ORT load FAILED: {error}")
         return False
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Share external weight data between split decoder models")
-    parser.add_argument(
-        "model_dir",
-        help="Directory containing decoder_init.onnx and decoder_step.onnx",
-    )
-    parser.add_argument(
-        "--suffix",
-        default=None,
-        help="Quantization suffix (e.g. 'int4' for decoder_init.int4.onnx)",
-    )
-    parser.add_argument(
-        "--also-int8",
-        action="store_true",
-        help="Also process the corresponding -int8 directory",
-    )
-    parser.add_argument(
-        "--verify",
-        action="store_true",
-        help="Run onnx.checker and ORT load verification after sharing",
-    )
+    parser = argparse.ArgumentParser(description="Share weights between split decoder models")
+    parser.add_argument("model_dir")
+    parser.add_argument("--suffix", default=None)
+    parser.add_argument("--also-int8", action="store_true")
+    parser.add_argument("--verify", action="store_true")
     args = parser.parse_args()
-
     dirs = [args.model_dir]
     if args.also_int8:
-        int8_dir = args.model_dir.rstrip("/") + "-int8"
-        if os.path.isdir(int8_dir):
-            dirs.append(int8_dir)
-        else:
-            print(f"INT8 directory not found: {int8_dir}")
-
-    init_name, step_name = _decoder_filenames(args.suffix)
-
-    for model_dir in dirs:
-        print(f"\n{'=' * 60}")
-        print(f"Processing: {model_dir} (suffix={args.suffix or 'none'})")
-        print(f"{'=' * 60}")
-
-        ok = share_external_models(model_dir, suffix=args.suffix)
-
-        if ok and args.verify:
-            print("\n  Verification:")
-            verify_model(model_dir, init_name)
-            verify_model(model_dir, step_name)
-            verify_inference(model_dir, suffix=args.suffix)
-
-    print("\nDone.")
+        dirs.append(args.model_dir.rstrip("/") + "-int8")
+    try:
+        for model_dir in dirs:
+            share_external_models(model_dir, suffix=args.suffix)
+            if args.verify and not verify_inference(model_dir, suffix=args.suffix):
+                return 1
+    except Exception as error:
+        print(f"ERROR: {error}")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
