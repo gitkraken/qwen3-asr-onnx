@@ -150,7 +150,8 @@ class EncoderWrapper(nn.Module):
         num_conv_windows = T_padded // CONV_WINDOW
 
         # [1, 128, T_padded] -> [N, 1, 128, CONV_WINDOW]
-        assert mel.shape[0] == 1, f"Expected batch=1, got {mel.shape[0]}"
+        if not torch.onnx.is_in_onnx_export():
+            assert mel.shape[0] == 1, f"Expected batch=1, got {mel.shape[0]}"
         x = mel.squeeze(0)  # [128, T_padded]
         x = x.reshape(128, num_conv_windows, CONV_WINDOW)  # [128, N, 100]
         x = x.permute(1, 0, 2)  # [N, 128, 100]

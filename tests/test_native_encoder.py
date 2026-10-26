@@ -4,6 +4,7 @@ import numpy as np
 import onnxruntime as ort
 import pytest
 import torch
+from onnxruntime.capi.onnxruntime_pybind11_state import InvalidArgument
 from qwen_asr.core.transformers_backend.configuration_qwen3_asr import Qwen3ASRAudioEncoderConfig
 from qwen_asr.core.transformers_backend.modeling_qwen3_asr import Qwen3ASRAudioEncoder
 
@@ -128,3 +129,13 @@ def test_native_reference_rejects_non_tensor_output(native_tower, monkeypatch):
     with pytest.raises(TypeError, match="must return a tensor"):
         run_native_encoder(native_tower, torch.zeros(1, 128, 50))
     assert [dict(layer.self_attn._forward_pre_hooks) for layer in native_tower.layers] == before
+
+
+def test_wrapper_rejects_multiple_batches(encoder_wrapper):
+    with pytest.raises(AssertionError, match="Expected batch=1"):
+        encoder_wrapper(torch.zeros(2, 128, 50))
+
+
+def test_onnx_rejects_multiple_batches(dynamic_onnx):
+    with pytest.raises(InvalidArgument, match="Got invalid dimensions"):
+        dynamic_onnx.run(["audio_features"], {"mel": np.zeros((2, 128, 50), dtype=np.float32)})
