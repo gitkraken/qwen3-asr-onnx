@@ -116,6 +116,16 @@ def external_data_files(model_path):
     }
 
 
+def graph_file_closure(root, names):
+    root = Path(root).resolve()
+    graphs = set(names)
+    files = set(graphs)
+    for name in graphs:
+        for path in external_data_files(root / name):
+            files.add(path.relative_to(root).as_posix())
+    return files
+
+
 def _tensor_chunks(tensor, root):
     if tensor.data_location != onnx.TensorProto.EXTERNAL:
         yield tensor.raw_data

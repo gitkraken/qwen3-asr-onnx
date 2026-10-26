@@ -13,9 +13,11 @@ Usage:
 import argparse
 import os
 import tarfile
+import tempfile
 
 from huggingface_hub import HfApi
 
+from share_weights import graph_file_closure
 from src.tokenizer_assets import tokenizer_asset_names, validate_tokenizer_assets
 
 # Shared metadata files included in every archive
@@ -90,11 +92,19 @@ def create_tar(archive, output_dir):
         if not os.path.isfile(os.path.join(source_dir, filename)):
             print(f"  ERROR: {os.path.join(source_dir, filename)} not found")
             return None
+    try:
+        all_files.update(graph_file_closure(source_dir, (file for file in archive["files"] if file.endswith(".onnx"))))
+    except Exception as error:
+        print(f"  ERROR: Invalid graph dependencies: {error}")
+        return None
     print(f"  Creating {tar_path}...")
     try:
-        with tarfile.open(tar_path, "w:gz", compresslevel=1, dereference=True) as target:
-            for filename in sorted(all_files):
-                target.add(os.path.join(source_dir, filename), arcname=f"{name}/{filename}", recursive=False)
+        with tempfile.TemporaryDirectory(prefix=".archive-", dir=output_dir) as stage:
+            staged_tar = os.path.join(stage, f"{name}.tar.gz")
+            with tarfile.open(staged_tar, "w:gz", compresslevel=1, dereference=True) as target:
+                for filename in sorted(all_files):
+                    target.add(os.path.join(source_dir, filename), arcname=f"{name}/{filename}", recursive=False)
+            os.replace(staged_tar, tar_path)
     except (OSError, tarfile.TarError) as error:
         print(f"  ERROR: Archive creation failed: {error}")
         return None

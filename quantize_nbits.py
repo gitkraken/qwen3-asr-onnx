@@ -49,7 +49,7 @@ from onnxruntime.quantization.matmul_nbits_quantizer import (
 )
 from onnxruntime.quantization.quant_utils import QuantFormat
 
-from share_weights import external_data_files, get_external_info, model_tensors
+from share_weights import external_data_files, get_external_info, graph_file_closure, model_tensors
 from src.tokenizer_assets import (
     TOKENIZER_FILES,
     copy_tokenizer_assets,
@@ -276,17 +276,20 @@ def main():
     # Copy non-quantized files from input to output (encoder, tokenizer, config, etc.)
     # Skip if input == output (in-place quantization).
     if os.path.realpath(args.input) != os.path.realpath(args.output):
-        for fname in os.listdir(args.input):
-            if fname in TOKENIZER_FILES:
-                continue
-            # Skip quantized decoder files (suffixed .int4/.int8 variants)
-            if any(fname.startswith(f"{n}{bits_suffix}") for n in ("decoder_init", "decoder_step")):
-                continue
+        files = {
+            fname
+            for fname in os.listdir(args.input)
+            if fname not in TOKENIZER_FILES
+            and not any(fname.startswith(f"{n}{bits_suffix}") for n in ("decoder_init", "decoder_step"))
+            and os.path.isfile(os.path.join(args.input, fname))
+        }
+        files.update(graph_file_closure(args.input, (fname for fname in files if fname.endswith(".onnx"))))
+        for fname in sorted(files):
             src = os.path.join(args.input, fname)
             dst = os.path.join(args.output, fname)
-            if os.path.isfile(src):
-                shutil.copy2(src, dst)
-                print(f"  Copied {fname}")
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            print(f"  Copied {fname}")
 
     if tokenizer_asset_names(args.input):
         copy_tokenizer_assets(args.input, args.output)

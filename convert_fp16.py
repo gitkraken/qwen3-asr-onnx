@@ -22,7 +22,7 @@ import shutil
 import onnx
 from onnxconverter_common import convert_float_to_float16
 
-from share_weights import share_external_models
+from share_weights import graph_file_closure, share_external_models
 from src.tokenizer_assets import copy_tokenizer_assets, tokenizer_asset_names, validate_tokenizer_assets
 
 
@@ -100,15 +100,15 @@ def main():
 
     # Copy non-converted files
     print("\nCopying supporting files...")
-    for filename in [
-        "encoder.onnx",
-        "embed_tokens.bin",
-        "config.json",
-    ]:
+    files = {"embed_tokens.bin", "config.json"}
+    if os.path.isfile(os.path.join(args.input, "encoder.onnx")):
+        files.update(graph_file_closure(args.input, ["encoder.onnx"]))
+    for filename in sorted(files):
         src = os.path.join(args.input, filename)
         if os.path.exists(src):
             dst = os.path.join(args.output, filename)
             if not os.path.exists(dst):
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.copy2(src, dst)
                 print(f"  Copied {filename}")
 

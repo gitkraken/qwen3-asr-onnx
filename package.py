@@ -12,7 +12,7 @@ from pathlib import Path
 import onnx
 import onnxruntime as ort
 
-from share_weights import external_data_files, share_external_models
+from share_weights import graph_file_closure, share_external_models
 from src.embeddings import load_embed_tokens
 from src.tokenizer_assets import tokenizer_asset_names, validate_tokenizer_assets
 
@@ -22,14 +22,6 @@ REQUIRED_METADATA = ["config.json", "preprocessor_config.json", "tokenizer.json"
 def _graph_names(suffix=""):
     tag = f".{suffix}" if suffix else ""
     return [f"encoder{tag}.onnx", f"decoder_init{tag}.onnx", f"decoder_step{tag}.onnx"]
-
-
-def _dependencies(root, names):
-    files = set(names)
-    for name in names:
-        for path in external_data_files(root / name):
-            files.add(path.relative_to(root).as_posix())
-    return files
 
 
 def copy_file(src, dst, hardlink=False):
@@ -142,7 +134,7 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
         metadata = {"config.json", "preprocessor_config.json"} | tokenizer_asset_names(source)
         names = set(metadata)
         for variant in variants:
-            names.update(_dependencies(source, _graph_names(variant)))
+            names.update(graph_file_closure(source, _graph_names(variant)))
         for name in sorted(names):
             copy_file(source / name, release / name, hardlink=hardlink and name in metadata)
         embed.tofile(release / "embed_tokens.bin")
@@ -158,7 +150,7 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
         if test_wavs_src is not None:
             copy_file(test_wavs_src, release / "test_wavs" / "0.wav")
             shared.add("test_wavs/0.wav")
-        variant_files = {variant: _dependencies(release, _graph_names(variant)) for variant in variants}
+        variant_files = {variant: graph_file_closure(release, _graph_names(variant)) for variant in variants}
         complete = shared | set().union(*variant_files.values())
         for path in release.rglob("*"):
             if path.is_file() and path.relative_to(release).as_posix() not in complete:

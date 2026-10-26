@@ -22,6 +22,7 @@ import tempfile
 import onnx
 from onnxruntime.quantization import QuantType, quantize_dynamic
 
+from share_weights import graph_file_closure
 from src.tokenizer_assets import (
     TOKENIZER_FILES,
     copy_tokenizer_assets,
@@ -196,17 +197,18 @@ def main():
     # Copy non-quantized files (skip if input == output)
     if os.path.realpath(args.input) != os.path.realpath(args.output):
         print("\nCopying non-quantized files...")
-        for fname in os.listdir(args.input):
-            if fname in TOKENIZER_FILES:
-                continue
-            # Skip quantized variants
-            if suffix in fname:
-                continue
+        files = {
+            fname
+            for fname in os.listdir(args.input)
+            if fname not in TOKENIZER_FILES and suffix not in fname and os.path.isfile(os.path.join(args.input, fname))
+        }
+        files.update(graph_file_closure(args.input, (fname for fname in files if fname.endswith(".onnx"))))
+        for fname in sorted(files):
             src = os.path.join(args.input, fname)
             dst = os.path.join(args.output, fname)
-            if os.path.isfile(src):
-                shutil.copy2(src, dst)
-                print(f"  Copied {fname}")
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            print(f"  Copied {fname}")
 
     if tokenizer_asset_names(args.input):
         copy_tokenizer_assets(args.input, args.output)

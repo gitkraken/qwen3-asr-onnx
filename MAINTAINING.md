@@ -94,7 +94,10 @@ destination must be separate from the source. The shared tokenizer-asset contrac
 preserves embedded/JSON/Jinja templates across conversion and archiving, removes
 stale destination template assets when the source has tokenizer assets, and requires a locally renderable ASR prompt
 before a package can be published. An archive or validation failure is a failed
-command. Kepler continues using its own manifest-driven publisher.
+command. Standalone archives include the ONNX external-data closure and replace a
+prior tar only after a complete staged write. Tokenizer validation uses built-in
+classes; local asset metadata cannot authorize Python modules. Kepler continues
+using its own manifest-driven publisher.
 
 ## Shared-weight recovery
 

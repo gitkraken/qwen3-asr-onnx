@@ -362,3 +362,92 @@ def test_nbits_invalid_tokenizer_rejected_before_output(tmp_path):
     )
     assert result.returncode != 0
     assert not target.exists()
+
+
+@pytest.mark.parametrize("script", ["convert_fp16.py", "quantize_static.py", "quantize.py", "quantize_nbits.py"])
+def test_converter_cli_copies_external_encoder_closure(tmp_path, script):
+    source = _source(tmp_path / "source", "embedded")
+    (source / "weights").mkdir()
+    _write_model(source, "encoder.onnx", external=True, data_name="weights/encoder.data")
+    if script == "quantize_nbits.py":
+        for name in ("decoder_init.onnx", "decoder_step.onnx"):
+            _write_model(source, name, weight=np.ones((64, 64), dtype=np.float32))
+    target = tmp_path / "target"
+    if script == "quantize_nbits.py":
+        command = [
+            sys.executable,
+            str(ROOT / script),
+            "--input",
+            str(source),
+            "--output",
+            str(target),
+            "--bits",
+            "4",
+            "--block-size",
+            "32",
+        ]
+    else:
+        command = _converter_command(tmp_path, script, source, target)
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=os.environ | {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (target / "weights" / "encoder.data").read_bytes() == (source / "weights" / "encoder.data").read_bytes()
+    onnx.load(target / "encoder.onnx")
+
+
+@pytest.mark.parametrize("script", ["quantize.py", "quantize_nbits.py"])
+def test_quantizer_cli_copies_nested_decoder_dependencies(tmp_path, script):
+    source = _source(tmp_path / "source", "embedded")
+    (source / "weights").mkdir()
+    weight = np.ones((64, 64), dtype=np.float32) if script == "quantize_nbits.py" else None
+    for name in ("decoder_init.onnx", "decoder_step.onnx"):
+        _write_model(source, name, external=True, data_name=f"weights/{name}.data", weight=weight)
+    target = tmp_path / "target"
+    if script == "quantize_nbits.py":
+        command = [
+            sys.executable,
+            str(ROOT / script),
+            "--input",
+            str(source),
+            "--output",
+            str(target),
+            "--bits",
+            "4",
+            "--block-size",
+            "32",
+        ]
+    else:
+        command = _converter_command(tmp_path, script, source, target)
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=os.environ | {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    for name in ("decoder_init.onnx", "decoder_step.onnx"):
+        assert (target / "weights" / f"{name}.data").read_bytes() == (source / "weights" / f"{name}.data").read_bytes()
+        onnx.load(target / name)
+
+
+def test_local_tokenizer_metadata_cannot_execute_python(tmp_path):
+    source = _source(tmp_path / "source", "embedded")
+    marker = tmp_path / "executed"
+    (source / "tokenizer_probe.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\n"
+        "from transformers import PreTrainedTokenizerFast\n"
+        "class ProbeTokenizer(PreTrainedTokenizerFast): pass\n"
+    )
+    config_path = source / "tokenizer_config.json"
+    config = json.loads(config_path.read_text())
+    config["tokenizer_class"] = "PreTrainedTokenizerFast"
+    config["auto_map"] = {"AutoTokenizer": ["tokenizer_probe.ProbeTokenizer", None]}
+    config_path.write_text(json.dumps(config))
+    validate_tokenizer_assets(source)
+    assert not marker.exists()

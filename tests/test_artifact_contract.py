@@ -372,3 +372,49 @@ def test_archive_cache_symlinks_are_materialized(tmp_path):
         archive.extractall(tmp_path / "extracted", filter="data")
     tokenizer = load_prompt_tokenizer(str(tmp_path / "extracted" / "portable"), local_files_only=True)
     assert build_prompt_ids(3, tokenizer, context="Kepler") == expected
+
+
+def test_standalone_archive_includes_external_encoder_closure(tmp_path):
+    from create_tar import create_tar
+
+    source = _release_input(tmp_path / "source", external=True)
+    assert pack.package(str(source), str(tmp_path / "release"))
+    release = tmp_path / "release"
+    archive = {
+        "name": "bundle",
+        "source_dir": str(release),
+        "files": ["encoder.onnx", "decoder_init.onnx", "decoder_step.onnx", "decoder_weights.data"],
+    }
+    path = create_tar(archive, str(tmp_path))
+    assert path is not None
+    with tarfile.open(path) as tar:
+        assert "bundle/encoder.onnx.data" in tar.getnames()
+        tar.extractall(tmp_path / "extracted", filter="data")
+    onnx.load(tmp_path / "extracted" / "bundle" / "encoder.onnx")
+
+
+def test_standalone_archive_failure_preserves_prior_bytes(tmp_path, monkeypatch):
+    from create_tar import create_tar
+
+    source = _release_input(tmp_path / "source", external=True)
+    assert pack.package(str(source), str(tmp_path / "release"))
+    archive = {
+        "name": "bundle",
+        "source_dir": str(tmp_path / "release"),
+        "files": ["encoder.onnx", "decoder_init.onnx", "decoder_step.onnx", "decoder_weights.data"],
+    }
+    destination = tmp_path / "bundle.tar.gz"
+    destination.write_bytes(b"retained archive")
+    original_add = tarfile.TarFile.add
+    count = 0
+
+    def interrupt(self, *args, **kwargs):
+        nonlocal count
+        count += 1
+        if count == 2:
+            raise OSError("injected archive write failure")
+        return original_add(self, *args, **kwargs)
+
+    monkeypatch.setattr(tarfile.TarFile, "add", interrupt)
+    assert create_tar(archive, str(tmp_path)) is None
+    assert destination.read_bytes() == b"retained archive"
