@@ -124,6 +124,7 @@ def quantize_decoder(
     validate_quantization_request(bits, block_size, algo, calib_data_path, nodes_to_exclude)
     print(f"  Loading {os.path.basename(input_path)} ...")
     if algo == "gptq":
+        assert calib_data_path is not None
         algo_config = GPTQWeightOnlyQuantConfig(
             calibration_data_reader=NpzCalibrationReader(calib_data_path),
             block_size=block_size,
