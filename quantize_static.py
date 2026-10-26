@@ -40,6 +40,7 @@ from onnxruntime.quantization import (
 )
 
 from share_weights import share_external_models
+from src.tokenizer_assets import copy_tokenizer_assets, tokenizer_asset_names, validate_tokenizer_assets
 
 # ---------------------------------------------------------------------------
 # Calibration data collection
@@ -323,6 +324,8 @@ def main():
         help="Directory to cache/load calibration data (.npz)",
     )
     args = parser.parse_args()
+    if tokenizer_asset_names(args.input):
+        validate_tokenizer_assets(args.input)
 
     os.makedirs(args.output, exist_ok=True)
 
@@ -413,10 +416,6 @@ def main():
         "encoder.onnx",
         "embed_tokens.bin",
         "config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "added_tokens.json",
-        "vocab.json",
     ]:
         src = os.path.join(args.input, filename)
         if os.path.exists(src):
@@ -424,6 +423,9 @@ def main():
             if not os.path.exists(dst):
                 shutil.copy2(src, dst)
                 print(f"  Copied {filename}")
+
+    if tokenizer_asset_names(args.input):
+        copy_tokenizer_assets(args.input, args.output)
 
     # Update config
     config_path = os.path.join(args.output, "config.json")

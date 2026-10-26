@@ -1,13 +1,23 @@
 import builtins
+import shutil
 from pathlib import Path
 
 import numpy as np
 import onnx
+import onnxruntime as ort
 import pytest
-from onnx import numpy_helper
+import torch
+from onnx import TensorProto, helper, numpy_helper
 
 import share_weights as share
 from tests.test_artifact_contract import _ort_result, _write_model
+from tests.test_native_decoder import (
+    assert_decoder_matches,
+    prefill_inputs,
+)
+from tests.test_native_decoder import decoder_exports as decoder_exports
+from tests.test_native_decoder import decoder_threads as decoder_threads
+from tests.test_native_decoder import text_model as text_model
 
 
 def _pair(root, inline=False):
@@ -175,3 +185,151 @@ def test_live_incompatible_canonical_data_is_not_overwritten(tmp_path):
         share.share_external_models(tmp_path)
     assert canonical.read_bytes() == original
     _assert_pair(tmp_path, expected)
+
+
+@pytest.mark.parametrize("data_name", ["embed_tokens.bin", "weights.bin", "sub/weights.data"])
+def test_sharing_retains_independently_owned_dependencies(tmp_path, data_name):
+    (tmp_path / data_name).parent.mkdir(parents=True, exist_ok=True)
+    for name in ("decoder_init.onnx", "decoder_step.onnx"):
+        _write_model(tmp_path, name, external=True, data_name=data_name)
+    expected = {name: _ort_result(tmp_path / name) for name in share._decoder_filenames()}
+    data = tmp_path / data_name
+    original = data.read_bytes()
+    auxiliary = None
+    if data_name.startswith("sub/"):
+        auxiliary = data.parent / "aux.onnx"
+        proto = onnx.load(tmp_path / "decoder_init.onnx", load_external_data=False)
+        for entry in proto.graph.initializer[0].external_data:
+            if entry.key == "location":
+                entry.value = data.name
+        onnx.save(proto, auxiliary)
+        auxiliary_before = _ort_result(auxiliary)
+    if data_name == "embed_tokens.bin":
+        import json
+
+        from src.embeddings import load_embed_tokens
+
+        config = {"decoder": {"vocab_size": 64, "hidden_size": 16}}
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        embeddings_before = load_embed_tokens(tmp_path)
+    assert share.share_external_models(tmp_path)
+    assert data.read_bytes() == original
+    _assert_pair(tmp_path, expected)
+    if auxiliary is not None:
+        np.testing.assert_array_equal(_ort_result(auxiliary), auxiliary_before)
+    if data_name == "embed_tokens.bin":
+        np.testing.assert_array_equal(load_embed_tokens(tmp_path), embeddings_before)
+
+
+def _run_model(path, feed):
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    return ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"]).run(None, feed)
+
+
+def test_shared_native_decoder_preserves_prefill_and_step(tmp_path, decoder_exports, text_model):
+    for path in decoder_exports["init"].parent.iterdir():
+        shutil.copy2(path, tmp_path / path.name)
+    with torch.no_grad():
+        _, prefill_feed = prefill_inputs(text_model, 1, 7, 1, 2)
+        before = _run_model(tmp_path / "decoder_init.onnx", prefill_feed)
+        token = torch.tensor([[3]], dtype=torch.int64)
+        step_feed = {
+            "input_embeds": text_model.thinker.model.embed_tokens(token).numpy(),
+            "position_ids": np.array([[7]], dtype=np.int64),
+            "past_keys": before[1],
+            "past_values": before[2],
+        }
+        before_step = _run_model(tmp_path / "decoder_step.onnx", step_feed)
+    assert share.share_external_models(tmp_path)
+    assert_decoder_matches(_run_model(tmp_path / "decoder_init.onnx", prefill_feed), before)
+    assert_decoder_matches(_run_model(tmp_path / "decoder_step.onnx", step_feed), before_step)
+    _assert_clean(tmp_path)
+
+
+@pytest.mark.parametrize("kind", ["Constant", "ConstantOfShape", "Split"])
+def test_shape_and_attribute_constants_stay_executable(tmp_path, kind):
+    shape = numpy_helper.from_array(np.array([2, 2], dtype=np.int64), name="shape")
+    if kind == "Constant":
+        nodes = [
+            helper.make_node("Constant", [], ["shape"], value=shape),
+            helper.make_node("Reshape", ["x", "shape"], ["y"]),
+        ]
+        inputs = [helper.make_tensor_value_info("x", TensorProto.FLOAT, [4])]
+        initializers = []
+        output_shape = [2, 2]
+        feed = {"x": np.arange(4, dtype=np.float32)}
+    elif kind == "ConstantOfShape":
+        nodes = [
+            helper.make_node(
+                "ConstantOfShape", ["shape"], ["y"], value=numpy_helper.from_array(np.array([1.0], dtype=np.float32))
+            )
+        ]
+        inputs = []
+        initializers = [shape]
+        output_shape = [2, 2]
+        feed = {}
+    else:
+        initializers = [numpy_helper.from_array(np.ones(129, dtype=np.int64), name="splits")]
+        outputs = ["y", *[f"unused{i}" for i in range(128)]]
+        nodes = [helper.make_node("Split", ["x", "splits"], outputs, axis=0)]
+        inputs = [helper.make_tensor_value_info("x", TensorProto.FLOAT, [129])]
+        output_shape = [1]
+        feed = {"x": np.arange(129, dtype=np.float32)}
+    graph = helper.make_graph(
+        nodes, kind, inputs, [helper.make_tensor_value_info("y", TensorProto.FLOAT, output_shape)], initializers
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)], ir_version=10)
+    for name in share._decoder_filenames():
+        onnx.save(model, tmp_path / name)
+    before = _run_model(tmp_path / "decoder_init.onnx", feed)
+    assert share.share_external_models(tmp_path)
+    for name in share._decoder_filenames():
+        np.testing.assert_array_equal(_run_model(tmp_path / name, feed)[0], before[0])
+        proto = onnx.load(tmp_path / name, load_external_data=False)
+        assert all(t.data_location != TensorProto.EXTERNAL for t in share.model_tensors(proto))
+
+
+@pytest.mark.parametrize("inline", [False, True])
+def test_staged_runtime_failure_preserves_source_pair(tmp_path, monkeypatch, inline):
+    expected = _pair(tmp_path, inline=inline)
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    original = ort.InferenceSession
+
+    def fail_staged(path, *args, **kwargs):
+        if Path(path).parent.name.startswith(".share-"):
+            raise RuntimeError("injected staged runtime failure")
+        return original(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ort, "InferenceSession", fail_staged)
+        with pytest.raises(RuntimeError, match="staged runtime"):
+            share.share_external_models(tmp_path)
+    assert before == {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    _assert_pair(tmp_path, expected)
+
+
+@pytest.mark.parametrize("dtype,suffix", [(np.float32, "q4"), (np.float16, "q4f16")])
+def test_shared_quantized_variants_pass_real_cpu_sessions(tmp_path, dtype, suffix):
+    from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
+
+    tensor_type = TensorProto.FLOAT16 if dtype == np.float16 else TensorProto.FLOAT
+    weight = numpy_helper.from_array(np.arange(64 * 32, dtype=dtype).reshape(64, 32) / 2048, name="weight")
+    graph = helper.make_graph(
+        [helper.make_node("MatMul", ["x", "weight"], ["y"], name="matmul")],
+        "quantized",
+        [helper.make_tensor_value_info("x", tensor_type, [1, 64])],
+        [helper.make_tensor_value_info("y", tensor_type, [1, 32])],
+        [weight],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)], ir_version=10)
+    quantizer = MatMulNBitsQuantizer(model, bits=4, block_size=32, is_symmetric=False, accuracy_level=4)
+    quantizer.process()
+    for name in share._decoder_filenames(suffix):
+        onnx.save(quantizer.model.model, tmp_path / name)
+    feed = {"x": np.ones((1, 64), dtype=dtype)}
+    before = _run_model(tmp_path / share._decoder_filenames(suffix)[0], feed)
+    assert share.share_external_models(tmp_path, suffix=suffix)
+    for name in share._decoder_filenames(suffix):
+        np.testing.assert_array_equal(_run_model(tmp_path / name, feed)[0], before[0])

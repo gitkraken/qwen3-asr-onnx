@@ -215,6 +215,7 @@ def validate_encoder(model, sessions, mel_np, mel_torch, device, *, atol=1e-4, r
     onnx_features = run_encoder_onnx(sessions["encoder"], mel_np)
     compare_features(native_features, pt_features, "native vs wrapper", atol=atol, rtol=rtol)
     compare_features(pt_features, onnx_features, "wrapper vs ONNX", atol=atol, rtol=rtol)
+    compare_features(native_features, onnx_features, "native vs ONNX", atol=atol, rtol=rtol)
     return native_features, onnx_features
 
 

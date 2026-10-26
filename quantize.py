@@ -22,6 +22,8 @@ import tempfile
 import onnx
 from onnxruntime.quantization import QuantType, quantize_dynamic
 
+from src.tokenizer_assets import copy_tokenizer_assets, tokenizer_asset_names, validate_tokenizer_assets
+
 ONNX_FILES = ["encoder.onnx", "decoder_init.onnx", "decoder_step.onnx"]
 
 
@@ -125,6 +127,8 @@ def main():
         help="Quantization weight type (default: int8)",
     )
     args = parser.parse_args()
+    if tokenizer_asset_names(args.input):
+        validate_tokenizer_assets(args.input)
 
     os.makedirs(args.output, exist_ok=True)
 
@@ -196,6 +200,9 @@ def main():
             if os.path.isfile(src):
                 shutil.copy2(src, dst)
                 print(f"  Copied {fname}")
+
+    if tokenizer_asset_names(args.input):
+        copy_tokenizer_assets(args.input, args.output)
 
     # Update config.json quantization metadata
     config_path = os.path.join(args.output, "config.json")

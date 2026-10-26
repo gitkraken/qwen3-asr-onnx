@@ -12,12 +12,14 @@ Usage:
 
 import argparse
 import os
-import subprocess
+import tarfile
 
 from huggingface_hub import HfApi
 
+from src.tokenizer_assets import tokenizer_asset_names, validate_tokenizer_assets
+
 # Shared metadata files included in every archive
-METADATA = ["embed_tokens.bin", "config.json", "tokenizer.json"]
+METADATA = ["embed_tokens.bin", "config.json"]
 
 # Archives are built from release/ dirs (produced by package.py), which contain
 # the correct FP16 embed_tokens.bin and patched config.json.
@@ -75,40 +77,26 @@ def create_tar(archive, output_dir):
     """Create a tar.gz archive with the correct directory structure."""
     name = archive["name"]
     source_dir = archive["source_dir"]
-    all_files = archive["files"] + METADATA
+    try:
+        validate_tokenizer_assets(source_dir)
+    except Exception as error:
+        print(f"  ERROR: Invalid tokenizer assets: {error}")
+        return None
+    all_files = set(archive["files"]) | set(METADATA) | tokenizer_asset_names(source_dir)
+    if os.path.isfile(os.path.join(source_dir, "preprocessor_config.json")):
+        all_files.add("preprocessor_config.json")
     tar_path = os.path.join(output_dir, f"{name}.tar.gz")
-
-    # Verify all source files exist
-    for f in all_files:
-        src = os.path.join(source_dir, f)
-        if not os.path.exists(src):
-            print(f"  ERROR: {src} not found")
+    for filename in sorted(all_files):
+        if not os.path.isfile(os.path.join(source_dir, filename)):
+            print(f"  ERROR: {os.path.join(source_dir, filename)} not found")
             return None
-
-    # Get source directory basename for --transform
-    source_basename = os.path.basename(source_dir.rstrip("/"))
-
-    # Build tar file list (relative to parent of source_dir)
-    parent_dir = os.path.dirname(os.path.abspath(source_dir))
-    tar_members = [f"{source_basename}/{f}" for f in all_files]
-
-    # Use --transform to rename the top-level directory if needed
-    cmd = ["tar", "cf", "-", "-C", parent_dir]
-    if source_basename != name:
-        cmd += [f"--transform=s,^{source_basename},{name},"]
-    cmd += tar_members
-
-    # Pipe through gzip -1 (fast, weights are incompressible)
     print(f"  Creating {tar_path}...")
-    with open(tar_path, "wb") as f:
-        tar_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
-        gz_proc = subprocess.Popen(["gzip", "-1"], stdin=tar_proc.stdout, stdout=f)
-        tar_proc.stdout.close()
-        gz_proc.wait()
-        tar_proc.wait()
-
-    if tar_proc.returncode != 0 or gz_proc.returncode != 0:
-        print("  ERROR: tar/gzip failed")
+    try:
+        with tarfile.open(tar_path, "w:gz", compresslevel=1, dereference=True) as target:
+            for filename in sorted(all_files):
+                target.add(os.path.join(source_dir, filename), arcname=f"{name}/{filename}", recursive=False)
+    except (OSError, tarfile.TarError) as error:
+        print(f"  ERROR: Archive creation failed: {error}")
         return None
 
     size = os.path.getsize(tar_path)
@@ -137,6 +125,7 @@ def main():
     args = parser.parse_args()
 
     results = []
+    failed = False
 
     for archive in ARCHIVES:
         name = archive["name"]
@@ -149,6 +138,7 @@ def main():
 
         tar_path = create_tar(archive, args.output_dir)
         if tar_path is None:
+            failed = True
             print("  FAILED")
             continue
 
@@ -166,6 +156,8 @@ def main():
     print("Summary:")
     for filename, size_mb, repo in results:
         print(f"  {filename}: {size_mb:.1f} MB → {repo}")
+
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

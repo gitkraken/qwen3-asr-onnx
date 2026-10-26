@@ -145,6 +145,7 @@ def main():
             dynamic_axes={"mel": {2: "time"}, "audio_features": {1: "enc_time"}},
             opset_version=args.opset,
             do_constant_folding=True,
+            dynamo=False,
         )
 
     # Fix Reshape allowzero for DirectML compatibility

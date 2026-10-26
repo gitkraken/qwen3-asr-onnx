@@ -513,6 +513,7 @@ numpy==2.5.4 \
     #   numba
     #   onnx
     #   onnx-ir
+    #   onnxconverter-common
     #   onnxruntime
     #   onnxscript
     #   pandas
@@ -606,12 +607,16 @@ onnx==1.23.2 \
     --hash=sha256:e79e35e152d3095c6910ae81013bbc68679e32bfc0ca76f840968d4b6fdfb864
     # via
     #   onnx-ir
+    #   onnxconverter-common
     #   onnxscript
     #   qwen3-asr-onnx
 onnx-ir==1.1.0 \
     --hash=sha256:76cc313a788c073b75271c1b6abb172aaf90fcc6335ed40f9f3238b2064a2fa3 \
     --hash=sha256:b72176de575d820ec26864d17270d58ef886a7cf64db7649d15fcc3d5ae2a8ee
     # via onnxscript
+onnxconverter-common==1.16.0 \
+    --hash=sha256:df39ee96f17fff119dff10dd245467651b60b9e8a96020eb93402239794852f7
+    # via qwen3-asr-onnx
 onnxruntime==1.31.0 \
     --hash=sha256:09d56445c1753e66e0912de69d3f0184016ad9a191dcd6925bf5dd570d2bfbe5 \
     --hash=sha256:35758d7606d578ec5b9d65f6e8a1f488013194c3f6097038a3223cb26d35ef9a \
@@ -651,6 +656,7 @@ packaging==26.3 \
     #   huggingface-hub
     #   lazy-loader
     #   onnx-ir
+    #   onnxconverter-common
     #   onnxruntime
     #   onnxscript
     #   pooch
@@ -726,6 +732,7 @@ protobuf==7.36.2 \
     --hash=sha256:f4fee11ec330d238b34a05c9b675f693c20415d1c5bd7d5320cc2f8a798eb9cf
     # via
     #   onnx
+    #   onnxconverter-common
     #   onnxruntime
 psutil==7.2.2 \
     --hash=sha256:0746f5f8d406af344fd547f1c8daa5f5c33dbc293bb8d6a16d80b4bb88f59372 \

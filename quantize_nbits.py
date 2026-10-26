@@ -34,6 +34,10 @@ import argparse
 import json
 import os
 import shutil
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
 
 import numpy as np
 import onnx
@@ -44,6 +48,9 @@ from onnxruntime.quantization.matmul_nbits_quantizer import (
     RTNWeightOnlyQuantConfig,
 )
 from onnxruntime.quantization.quant_utils import QuantFormat
+
+from share_weights import external_data_files, get_external_info, model_tensors
+from src.tokenizer_assets import copy_tokenizer_assets, tokenizer_asset_names
 
 
 class NpzCalibrationReader(CalibrationDataReader):
@@ -111,6 +118,40 @@ def verify_quantized_precision(model, bits, block_size):
             )
 
 
+@contextmanager
+def _quantization_input(input_path: str, algo: str) -> Iterator[tuple[onnx.ModelProto | str, str | None]]:
+    if algo != "gptq":
+        yield onnx.load(input_path), None
+        return
+    source = Path(input_path).resolve()
+    dependencies = sorted(external_data_files(source))
+    with tempfile.TemporaryDirectory(prefix="qwen-gptq-") as temporary:
+        stage = Path(temporary)
+        locations = {path: f"weights/{index}.data" for index, path in enumerate(dependencies)}
+        for path, location in locations.items():
+            target = stage / location
+            target.parent.mkdir(exist_ok=True)
+            # ONNX rejects external tensor files with multiple hard links.
+            shutil.copy2(path, target)
+        model = onnx.load(source, load_external_data=False)
+        external_bytes = 0
+        for tensor in model_tensors(model):
+            if tensor.data_location != onnx.TensorProto.EXTERNAL:
+                continue
+            info = get_external_info(tensor)
+            dependency = (source.parent / info["location"]).resolve()
+            external_bytes += int(info.get("length", str(dependency.stat().st_size - int(info.get("offset", "0")))))
+            for entry in tensor.external_data:
+                if entry.key == "location":
+                    entry.value = locations[dependency]
+        if model.ByteSize() + external_bytes < onnx.checker.MAXIMUM_PROTOBUF:
+            # GPTQ runs smaller graphs from bytes, which cannot resolve adjacent data files.
+            onnx.external_data_helper.load_external_data_for_model(model, str(stage))
+        staged_model = stage / "model.onnx"
+        staged_model.write_bytes(model.SerializeToString())
+        yield str(staged_model), str(stage)
+
+
 def quantize_decoder(
     input_path: str,
     output_path: str,
@@ -130,32 +171,33 @@ def quantize_decoder(
             block_size=block_size,
             quant_format=QuantFormat.QOperator,
         )
-        model_arg = input_path
     else:
         algo_config = RTNWeightOnlyQuantConfig(quant_format=QuantFormat.QOperator)
-        model_arg = onnx.load(input_path)
 
-    quantizer = MatMulNBitsQuantizer(
-        model=model_arg,
-        bits=bits,
-        block_size=block_size,
-        is_symmetric=False,
-        accuracy_level=accuracy_level,
-        algo_config=algo_config,
-        nodes_to_exclude=nodes_to_exclude or None,
-    )
-    quantizer.process()
-    model = quantizer.model.model
-    verify_quantized_precision(model, bits, block_size)
+    with _quantization_input(input_path, algo) as (model_arg, external_root):
+        quantizer = MatMulNBitsQuantizer(
+            model=model_arg,
+            bits=bits,
+            block_size=block_size,
+            is_symmetric=False,
+            accuracy_level=accuracy_level,
+            algo_config=algo_config,
+            nodes_to_exclude=nodes_to_exclude or None,
+        )
+        quantizer.process()
+        model = quantizer.model.model
+        verify_quantized_precision(model, bits, block_size)
 
-    if not any(opset.domain == "com.microsoft" for opset in model.opset_import):
-        opset = model.opset_import.add()
-        opset.domain = "com.microsoft"
-        opset.version = 1
+        if not any(opset.domain == "com.microsoft" for opset in model.opset_import):
+            opset = model.opset_import.add()
+            opset.domain = "com.microsoft"
+            opset.version = 1
 
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    quantizer.model.save_model_to_file(output_path, use_external_data_format=True)
-    print(f"  Saved to {output_path}")
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        if external_root is not None:
+            onnx.external_data_helper.load_external_data_for_model(model, external_root)
+        quantizer.model.save_model_to_file(output_path, use_external_data_format=True)
+        print(f"  Saved to {output_path}")
 
 
 def main():
@@ -235,6 +277,9 @@ def main():
             if os.path.isfile(src):
                 shutil.copy2(src, dst)
                 print(f"  Copied {fname}")
+
+    if tokenizer_asset_names(args.input):
+        copy_tokenizer_assets(args.input, args.output)
 
     # Update config.json quantization field (merge with existing for split-decoder runs)
     config_path = os.path.join(args.output, "config.json")

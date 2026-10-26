@@ -53,7 +53,9 @@ def test_pipeline_max_tokens_and_transcript_failure(monkeypatch):
     assert counts == [7, 7]
 
 
-@pytest.mark.parametrize("fault", ["missing", "nan", "shape", "tolerance", "transcript", "decoder_nan"])
+@pytest.mark.parametrize(
+    "fault", ["missing", "nan", "shape", "tolerance", "transcript", "decoder_nan", "native_tolerance"]
+)
 def test_cli_returns_nonzero_for_validation_fault(tmp_path, fault):
     script = tmp_path / "fault.py"
     script.write_text("""
@@ -84,6 +86,9 @@ output=np.zeros((1,1,3),dtype=np.float32)
 if fault=='nan': output[:]=np.nan
 if fault=='shape': output=np.zeros((1,2,3),dtype=np.float32)
 if fault=='tolerance': output[:]=1
+if fault=='native_tolerance':
+    validate.run_encoder_pytorch=lambda *a,**k:torch.full((1,1,3),0.000075)
+    output[:]=0.000150
 validate.run_encoder_onnx=lambda *a,**k:output
 validate.greedy_decode_pytorch=lambda *a,**k:[10]
 def decode_onnx(*a,**k):
@@ -108,6 +113,7 @@ validate.main()
         "tolerance": "exceed",
         "transcript": "Transcript mismatch",
         "decoder_nan": "non-finite ONNX output",
+        "native_tolerance": "native vs ONNX: encoder features exceed",
     }[fault]
     assert expected in result.stdout + result.stderr
 
@@ -232,3 +238,17 @@ def test_encoder_default_tolerance_is_absolute():
     reference = np.full((1, 1, 3), 100000.0, dtype=np.float32)
     with pytest.raises(ValueError, match="exceed"):
         validate.compare_features(reference, reference + 0.5, "probe")
+
+
+def test_direct_native_tolerance_is_not_inferred_from_pairwise_passes(monkeypatch):
+    import src.native_encoder
+
+    native = torch.zeros(1, 1, 3)
+    wrapper = native + 0.000075
+    exported = np.full((1, 1, 3), 0.000150, dtype=np.float32)
+    monkeypatch.setattr(src.native_encoder, "run_native_encoder", lambda *a: native)
+    monkeypatch.setattr(validate, "run_encoder_pytorch", lambda *a: wrapper)
+    monkeypatch.setattr(validate, "run_encoder_onnx", lambda *a: exported)
+    model = SimpleNamespace(thinker=SimpleNamespace(audio_tower=None))
+    with pytest.raises(ValueError, match="native vs ONNX: encoder features exceed"):
+        validate.validate_encoder(model, {"encoder": object()}, None, None, "cpu")

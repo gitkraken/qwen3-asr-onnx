@@ -31,18 +31,44 @@ def _decoder_filenames(suffix=None):
     return f"decoder_init{tag}.onnx", f"decoder_step{tag}.onnx"
 
 
-def model_tensors(message):
+def _storage_tensors(message, initializer=False):
     if isinstance(message, onnx.TensorProto):
-        yield message
+        yield message, initializer
         return
     for field, value in message.ListFields():
         if field.type != FieldDescriptor.TYPE_MESSAGE:
             continue
         if field.is_repeated:
             for item in value:
-                yield from model_tensors(item)
+                yield from _storage_tensors(item, field.name == "initializer")
         else:
-            yield from model_tensors(value)
+            yield from _storage_tensors(value, field.name == "initializer")
+
+
+def model_tensors(message):
+    for tensor, _ in _storage_tensors(message):
+        yield tensor
+
+
+def _can_share(tensor, root, initializer):
+    # ORT materializes attributes and shape/control inputs before loading external weights.
+    if not initializer:
+        return False
+    if tensor.data_type in (
+        onnx.TensorProto.INT16,
+        onnx.TensorProto.INT32,
+        onnx.TensorProto.INT64,
+        onnx.TensorProto.UINT16,
+        onnx.TensorProto.UINT32,
+        onnx.TensorProto.UINT64,
+        onnx.TensorProto.BOOL,
+        onnx.TensorProto.STRING,
+    ):
+        return False
+    length = (
+        _external_range(root, tensor)[2] if tensor.data_location == onnx.TensorProto.EXTERNAL else len(tensor.raw_data)
+    )
+    return length >= 1024
 
 
 def get_external_info(tensor):
@@ -115,24 +141,30 @@ def set_tensor_external(tensor, location, offset, length):
         entry.value = value
 
 
-def _write_shared_data(models, root, path):
+def _write_shared_data(storage, root, path):
     index = {}
     with path.open("wb") as stream:
-        for model in models:
-            for tensor in model_tensors(model):
-                if tensor.data_location != onnx.TensorProto.EXTERNAL and not tensor.raw_data:
-                    continue
-                digest = hashlib.sha256()
-                length = 0
+        for tensor, shareable in storage:
+            if tensor.data_location != onnx.TensorProto.EXTERNAL and not tensor.raw_data:
+                continue
+            if not shareable:
+                if tensor.data_location == onnx.TensorProto.EXTERNAL:
+                    data = b"".join(_tensor_chunks(tensor, root))
+                    tensor.ClearField("external_data")
+                    tensor.data_location = onnx.TensorProto.DEFAULT
+                    tensor.raw_data = data
+                continue
+            digest = hashlib.sha256()
+            length = 0
+            for chunk in _tensor_chunks(tensor, root):
+                digest.update(chunk)
+                length += len(chunk)
+            key = (tensor.data_type, tuple(tensor.dims), length, digest.digest())
+            if key not in index:
+                index[key] = stream.tell()
                 for chunk in _tensor_chunks(tensor, root):
-                    digest.update(chunk)
-                    length += len(chunk)
-                key = (tensor.data_type, tuple(tensor.dims), length, digest.digest())
-                if key not in index:
-                    index[key] = stream.tell()
-                    for chunk in _tensor_chunks(tensor, root):
-                        stream.write(chunk)
-                set_tensor_external(tensor, path.name, index[key], length)
+                    stream.write(chunk)
+            set_tensor_external(tensor, path.name, index[key], length)
         stream.flush()
         os.fsync(stream.fileno())
 
@@ -144,7 +176,7 @@ def _file_digest(path):
 
 def _live_data_files(root):
     live = set()
-    for path in root.glob("*.onnx"):
+    for path in root.rglob("*.onnx"):
         live.update(external_data_files(path))
     return live
 
@@ -161,10 +193,10 @@ def _publish_data(staged, target, root):
     os.replace(staged, target)
 
 
-def _cleanup_data(root, names, old_files, shared_name):
-    candidates = old_files | {root / f"{name}.data" for name in names}
+def _cleanup_data(root, names):
+    candidates = {root / f"{name}.data" for name in names}
     live = _live_data_files(root)
-    for path in candidates - live - {root / shared_name}:
+    for path in candidates - live:
         if path.exists():
             path.unlink()
 
@@ -173,6 +205,18 @@ def _validate_models(root, names):
     for name in names:
         external_data_files(root / name)
         onnx.checker.check_model(str(root / name))
+
+
+def _validate_runtime_models(root, names):
+    import onnxruntime as ort
+
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    options.log_severity_level = 3
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    for name in names:
+        ort.InferenceSession(str(root / name), options, providers=["CPUExecutionProvider"])
 
 
 def share_external_models(model_dir, suffix=None):
@@ -184,26 +228,35 @@ def share_external_models(model_dir, suffix=None):
     old_files = set().union(*(external_data_files(root / name) for name in names))
     shared_name = _shared_data_name(suffix)
     _validate_models(root, names)
-    already_shared = old_files == {root / shared_name} and all(
-        not tensor.raw_data for model in models for tensor in model_tensors(model)
+    storage = [
+        (tensor, _can_share(tensor, root, initializer))
+        for model in models
+        for tensor, initializer in _storage_tensors(model)
+    ]
+    already_shared = (
+        (root / shared_name).is_file()
+        and old_files <= {root / shared_name}
+        and all((tensor.data_location == onnx.TensorProto.EXTERNAL) == shareable for tensor, shareable in storage)
     )
     if already_shared:
-        _cleanup_data(root, names, old_files, shared_name)
+        _validate_runtime_models(root, names)
+        _cleanup_data(root, names)
         return True
     with tempfile.TemporaryDirectory(prefix=".share-", dir=root) as tmp:
         stage = Path(tmp)
-        _write_shared_data(models, root, stage / shared_name)
+        _write_shared_data(storage, root, stage / shared_name)
         for model, name in zip(models, names):
             with open(stage / name, "wb") as stream:
                 stream.write(model.SerializeToString())
                 stream.flush()
                 os.fsync(stream.fileno())
         _validate_models(stage, names)
+        _validate_runtime_models(stage, names)
         _publish_data(stage / shared_name, root / shared_name, root)
         for name in names:
             os.replace(stage / name, root / name)
         _validate_models(root, names)
-        _cleanup_data(root, names, old_files, shared_name)
+    _cleanup_data(root, names)
     return True
 
 

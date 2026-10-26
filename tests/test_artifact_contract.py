@@ -1,4 +1,6 @@
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -11,6 +13,7 @@ import pytest
 from onnx import helper, numpy_helper
 
 import package as pack
+from tests.tokenizer_fixtures import save_tokenizer_assets
 
 
 def _write_model(root, name, *, external=False, data_name=None, weight=None):
@@ -44,8 +47,8 @@ def _release_input(root, dtype="float32", *, external=False):
         "embed_tokens_shape": [8, 4],
         "embed_tokens_dtype": dtype,
     }
-    for name in ("tokenizer.json", "tokenizer_config.json", "preprocessor_config.json"):
-        (root / name).write_text("{}")
+    (root / "preprocessor_config.json").write_text("{}")
+    save_tokenizer_assets(root)
     (root / "config.json").write_text(json.dumps(config))
     np.arange(32, dtype=dtype).reshape(8, 4).tofile(root / "embed_tokens.bin")
     return root
@@ -259,20 +262,11 @@ def test_required_metadata_must_be_valid_json_objects(tmp_path, name, contents):
 
 @pytest.mark.parametrize("template_file", ["chat_template.jinja", "chat_template.json"])
 def test_packaged_chat_template_reloads_offline(tmp_path, template_file, monkeypatch):
-    from tokenizers import Tokenizer, models
-    from transformers import AutoTokenizer, PreTrainedTokenizerFast
-
     from src.prompt import load_prompt_tokenizer
-    from tests.test_prompt_contract import OFFICIAL_CHAT_TEMPLATE
 
     source = _release_input(tmp_path / "source")
-    raw = Tokenizer(models.WordLevel({"[UNK]": 0, "word": 1}, unk_token="[UNK]"))
-    tokenizer = PreTrainedTokenizerFast(tokenizer_object=raw, unk_token="[UNK]")
-    tokenizer.chat_template = OFFICIAL_CHAT_TEMPLATE
-    tokenizer.save_pretrained(source)
-    if template_file == "chat_template.json":
-        (source / "chat_template.jinja").unlink()
-        (source / template_file).write_text(json.dumps({"chat_template": OFFICIAL_CHAT_TEMPLATE}))
+    template_format = "json" if template_file.endswith(".json") else "jinja"
+    tokenizer = save_tokenizer_assets(source, template_format=template_format)
     template_bytes = (source / template_file).read_bytes()
     messages = [
         {"role": "system", "content": "Kepler"},
@@ -287,8 +281,94 @@ def test_packaged_chat_template_reloads_offline(tmp_path, template_file, monkeyp
     assert (packaged / template_file).read_bytes() == template_bytes
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
-    offline = AutoTokenizer.from_pretrained(packaged, local_files_only=True)
-    if not offline.chat_template:
-        offline = load_prompt_tokenizer(str(packaged))
-    assert offline.chat_template == OFFICIAL_CHAT_TEMPLATE
+    offline = load_prompt_tokenizer(str(packaged))
+    assert offline.chat_template == tokenizer.chat_template
     assert offline.apply_chat_template(messages, add_generation_prompt=True, tokenize=False) == expected
+
+
+@pytest.mark.parametrize("source_name", ["release.tar.gz", "release-int4.tar.gz", "release.tar.gz/input"])
+def test_publication_destinations_cannot_overlap_source(tmp_path, source_name):
+    source = tmp_path / source_name
+    source.parent.mkdir(parents=True, exist_ok=True)
+    _release_input(source)
+    original = {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+    output = tmp_path / "release"
+    output.mkdir()
+    (output / "sentinel").write_text("old release")
+    assert not pack.package(str(source), str(output))
+    assert source.is_dir()
+    assert {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()} == original
+    assert (output / "sentinel").read_text() == "old release"
+
+
+@pytest.mark.parametrize("problem", ["missing-template", "invalid-template", "invalid-tokenizer"])
+def test_unusable_tokenizer_contract_preserves_previous_release(tmp_path, problem):
+    source = _release_input(tmp_path / "source")
+    if problem == "missing-template":
+        for name in ("chat_template.jinja", "chat_template.json"):
+            (source / name).unlink(missing_ok=True)
+        config = json.loads((source / "tokenizer_config.json").read_text())
+        config.pop("chat_template", None)
+        (source / "tokenizer_config.json").write_text(json.dumps(config))
+    elif problem == "invalid-template":
+        (source / "chat_template.jinja").write_text("{{ messages[0].content }}")
+    else:
+        (source / "tokenizer.json").write_text("{}")
+    output = tmp_path / "release"
+    output.mkdir()
+    (output / "sentinel").write_text("old release")
+    archive = tmp_path / "release.tar.gz"
+    archive.write_bytes(b"old archive")
+    assert not pack.package(str(source), str(output))
+    assert (output / "sentinel").read_text() == "old release"
+    assert archive.read_bytes() == b"old archive"
+
+
+def _symlink_metadata_to_cache(source, cache):
+    cache.mkdir()
+    names = {"config.json", "preprocessor_config.json"} | pack.tokenizer_asset_names(source)
+    for name in names:
+        path = source / name
+        target = cache / name
+        path.rename(target)
+        path.symlink_to(os.path.relpath(target, path.parent))
+    return names
+
+
+@pytest.mark.parametrize("hardlink", [False, True])
+def test_packaged_cache_symlinks_are_portable_offline(tmp_path, hardlink):
+    from src.prompt import build_prompt_ids, load_prompt_tokenizer
+
+    source = _release_input(tmp_path / "source")
+    cache = tmp_path / "hf-cache"
+    names = _symlink_metadata_to_cache(source, cache)
+    expected = build_prompt_ids(3, load_prompt_tokenizer(str(source), local_files_only=True), context="Kepler")
+    output = tmp_path / "release"
+    assert pack.package(source, output, hardlink=hardlink)
+    assert all(not (output / name).is_symlink() for name in names)
+    shutil.rmtree(source)
+    shutil.rmtree(cache)
+    with tarfile.open(tmp_path / "release.tar.gz") as archive:
+        assert all(member.isfile() for member in archive.getmembers())
+        archive.extractall(tmp_path / "extracted", filter="data")
+    for path in (output, tmp_path / "extracted" / "release"):
+        tokenizer = load_prompt_tokenizer(str(path), local_files_only=True)
+        assert build_prompt_ids(3, tokenizer, context="Kepler") == expected
+
+
+def test_archive_cache_symlinks_are_materialized(tmp_path):
+    from src.prompt import build_prompt_ids, load_prompt_tokenizer
+
+    source = _release_input(tmp_path / "source")
+    cache = tmp_path / "hf-cache"
+    names = _symlink_metadata_to_cache(source, cache)
+    expected = build_prompt_ids(3, load_prompt_tokenizer(str(source), local_files_only=True), context="Kepler")
+    archive_path = tmp_path / "portable.tar.gz"
+    pack._create_archive(source, archive_path, names | {"embed_tokens.bin"}, "portable")
+    shutil.rmtree(source)
+    shutil.rmtree(cache)
+    with tarfile.open(archive_path) as archive:
+        assert all(member.isfile() for member in archive.getmembers())
+        archive.extractall(tmp_path / "extracted", filter="data")
+    tokenizer = load_prompt_tokenizer(str(tmp_path / "extracted" / "portable"), local_files_only=True)
+    assert build_prompt_ids(3, tokenizer, context="Kepler") == expected

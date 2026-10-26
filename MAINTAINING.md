@@ -24,6 +24,7 @@ Use Python 3.12.13 and uv 0.11.20. `pyproject.toml` declares the runtime and tes
 dependencies; `uv.lock` fixes their complete resolution. Numerical dependencies
 initially match Kepler's reviewed export environment: torch 2.14.1,
 transformers 4.57.6, qwen-asr 0.0.6, ONNX 1.23.2 and ORT 1.31.0.
+The standalone FP16 converter uses pinned onnxconverter-common 1.16.0.
 Dataset evaluation additionally needs the platform's FFmpeg libraries for
 `datasets[audio]`/TorchCodec. Do not infer compatibility with another ORT or
 checkpoint version from constructor signatures.
@@ -70,7 +71,12 @@ uv export --locked --no-dev --format requirements-txt --output-file requirements
 | GPTQ | 4 | requested | Reject before output creation |
 
 An all-excluded/no-quantized-node model is rejected instead of receiving an int4
-label. This matrix does not change Kepler's own explicit 4-bit recipe.
+label. GPTQ receives an isolated model and its external-data closure, never the
+exporter's adjacent configuration. External data is copied, because ONNX rejects
+hardlinks. Smaller models are materialized inline for ORT's byte-based calibration
+sessions; larger models keep the external-data path. Staging can temporarily
+require the source weights' size in additional disk space. Input configuration
+and weights stay untouched on success or failure. This matrix does not change Kepler's own explicit 4-bit recipe.
 
 Embedding metadata declares `embed_tokens_shape` and `embed_tokens_dtype`.
 Readers validate dimensions, dtype, byte count and finite values. Legacy exports
@@ -83,14 +89,21 @@ validation.
 Packages require complete graph sets plus their actual external-data references,
 configuration, tokenizer and embeddings. Inline, per-decoder and shared weights
 are alternatives. The release and archives are staged and validated before
-replacing a prior usable release. An archive or validation failure is a failed
+replacing a prior usable release. Every publication and obsolete-archive removal
+destination must be separate from the source. The shared tokenizer-asset contract
+preserves embedded/JSON/Jinja templates across conversion and archiving, removes
+stale destination template assets, and requires a locally renderable ASR prompt
+before a package can be published. An archive or validation failure is a failed
 command. Kepler continues using its own manifest-driven publisher.
 
 ## Shared-weight recovery
 
 Sharing publishes the canonical `decoder_weights[.<suffix>].data` only after
 preparing and validating its data and graph references. Original data remains
-available while each graph is replaced. Those replacements are individually
+available while each graph is replaced. Required shape/control tensors and
+operator attributes remain inline, and staged CPU ORT sessions must load before
+publication. The supported q4 and q4f16 CPU paths are covered by real quantized
+fixtures; missing kernels on another target need an explicit reviewed exception. Those replacements are individually
 atomic; the filesystem does not provide a multi-file transaction. A retry must
 validate the real graphs and bytes before declaring an already-shared result.
 An existing canonical file with incompatible live references requires an
@@ -98,8 +111,9 @@ explicit rebuild error rather than being overwritten.
 
 Successful conventional decoder exports retain the two graph files and canonical
 shared data file. Temporary files owned by the conversion and unreferenced
-conventional per-decoder data are cleaned on retry. After a process crash,
-unreferenced data with custom original names may remain in the working directory;
+conventional per-decoder data are cleaned on retry after checking nested graph references. Arbitrary data
+dependencies are retained because a reference does not establish exclusive
+ownership; unreferenced data with custom original names may remain in the working directory;
 keep it until its ownership is known. Packaging includes only the verified file
 closure. Do not remove another graph's data merely because the current pair no
 longer references it. Use Kepler's output lock, stage fingerprints and invalidation
@@ -131,7 +145,7 @@ absolute and relative errors, runtime versions and checkpoint identities.
 
 The validator uses the official native encoder independently of the exported
 wrapper, checks shapes and finite values, enforces the existing absolute 1e-4
-encoder threshold, and fails on unacceptable transcript divergence or missing
+encoder threshold directly between native and ONNX as well as both intermediate comparisons, and fails on unacceptable transcript divergence or missing
 sessions. Wrapper-to-ONNX parity remains a separate check. Prompts use the official
 checkpoint chat template and tokenizer for roles, context and forced language.
 Check both original checkpoint tokenizers, including system=8948/user=872 and the

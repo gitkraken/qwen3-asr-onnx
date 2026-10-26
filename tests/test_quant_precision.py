@@ -32,7 +32,16 @@ def source(tmp_path):
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=10)
     for name in ["decoder_init", "decoder_step"]:
         onnx.save(model, inputs / f"{name}.onnx")
-    (inputs / "config.json").write_text("{}")
+    (inputs / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_asr",
+                "decoder": {"vocab_size": 4, "hidden_size": 64},
+                "embed_tokens_shape": [4, 64],
+                "embed_tokens_dtype": "float32",
+            }
+        )
+    )
     calib = tmp_path / "calib.npz"
     np.savez(calib, _n_samples=40, **{f"{i}_x": rng.normal(size=(2, 64)).astype(np.float32) for i in range(40)})
     return inputs, calib
@@ -224,3 +233,91 @@ def test_verifies_every_effective_operator_before_saving(tmp_path, monkeypatch):
         )
     assert not saved
     assert not (tmp_path / "out.int4.onnx").exists()
+
+
+def test_gptq_external_input_isolated_without_losing_unquantized_data(tmp_path):
+    import quantize_nbits
+
+    inputs, calib = source(tmp_path)
+    path = inputs / "decoder_init.onnx"
+    model = onnx.load(path)
+    model.graph.node[-1].output[0] = "linear"
+    model.graph.initializer.append(numpy_helper.from_array(np.full((32,), 0.25, dtype=np.float32), "bias"))
+    model.graph.node.append(helper.make_node("Add", ["linear", "bias"], ["y"], name="bias_add"))
+    (inputs / "weights").mkdir()
+    onnx.save_model(
+        model,
+        str(path),
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location="weights/decoder.data",
+        size_threshold=0,
+    )
+    original = {p.relative_to(inputs).as_posix(): p.read_bytes() for p in inputs.rglob("*") if p.is_file()}
+    x = np.ones((2, 64), dtype=np.float32)
+    reference = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"]).run(None, {"x": x})[0]
+    output = tmp_path / "quantized" / "decoder.int4.onnx"
+    quantize_nbits.quantize_decoder(str(path), str(output), 4, 32, 4, "gptq", str(calib))
+    session = ort.InferenceSession(str(output), providers=["CPUExecutionProvider"])
+    actual = session.run(None, {"x": x})[0]
+    assert actual.shape == reference.shape
+    assert np.isfinite(actual).all()
+    assert np.linalg.norm(actual - reference) / np.linalg.norm(reference) < 0.3
+    assert {p.relative_to(inputs).as_posix(): p.read_bytes() for p in inputs.rglob("*") if p.is_file()} == original
+    assert not any(
+        "qwen-gptq" in e.value
+        for t in onnx.load(output, load_external_data=False).graph.initializer
+        for e in t.external_data
+    )
+
+
+def test_gptq_failure_preserves_input_config_and_external_files(tmp_path, monkeypatch):
+    import quantize_nbits
+
+    inputs, calib = source(tmp_path)
+    path = inputs / "decoder_init.onnx"
+    onnx.save_model(
+        onnx.load(path),
+        str(path),
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=path.name + ".data",
+        size_threshold=0,
+    )
+    original = {p.name: p.read_bytes() for p in inputs.iterdir() if p.is_file()}
+    staged = []
+
+    class Quantizer:
+        def __init__(self, **kwargs):
+            model_path = Path(kwargs["model"])
+            assert model_path != path
+            assert not (model_path.parent / "config.json").exists()
+            assert model_path.exists()
+            staged.append(model_path.parent)
+
+        def process(self):
+            raise RuntimeError("quantizer fault")
+
+    monkeypatch.setattr(quantize_nbits, "MatMulNBitsQuantizer", Quantizer)
+    with pytest.raises(RuntimeError, match="quantizer fault"):
+        quantize_nbits.quantize_decoder(str(path), str(tmp_path / "result.int4.onnx"), 4, 32, 4, "gptq", str(calib))
+    assert staged and all(not p.exists() for p in staged)
+    assert {p.name: p.read_bytes() for p in inputs.iterdir() if p.is_file()} == original
+    assert not (tmp_path / "result.int4.onnx").exists()
+
+
+def test_quantization_replaces_stale_output_template(tmp_path):
+    from src.prompt import build_prompt_ids, load_prompt_tokenizer
+    from tests.tokenizer_fixtures import save_tokenizer_assets
+
+    inputs, _ = source(tmp_path)
+    save_tokenizer_assets(inputs, template_format="embedded")
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "chat_template.jinja").write_text("stale template")
+    result = cli(inputs, output)
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert not (output / "chat_template.jinja").exists()
+    assert build_prompt_ids(2, load_prompt_tokenizer(str(output), local_files_only=True)) == build_prompt_ids(
+        2, load_prompt_tokenizer(str(inputs), local_files_only=True)
+    )

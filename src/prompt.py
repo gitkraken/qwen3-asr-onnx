@@ -12,13 +12,13 @@ EOS_TOKEN_IDS = [ENDOFTEXT_TOKEN_ID, IM_END_TOKEN_ID]
 NEWLINE_TOKEN_ID = 198
 
 
-def load_prompt_tokenizer(model_id: str):
+def load_prompt_tokenizer(model_id: str, *, local_files_only: bool = False):
     from transformers import AutoTokenizer
     from transformers.utils import cached_file
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, local_files_only=local_files_only)
     if not tokenizer.chat_template:
-        template_path = cached_file(model_id, "chat_template.json")
+        template_path = cached_file(model_id, "chat_template.json", local_files_only=local_files_only)
         if template_path is None:
             raise ValueError(f"Missing official chat_template.json for {model_id}")
         with open(template_path) as stream:

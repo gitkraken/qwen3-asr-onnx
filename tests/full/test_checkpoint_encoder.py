@@ -13,7 +13,7 @@ from safetensors import safe_open
 
 from src.encoder_wrapper import EncoderWrapper
 from src.native_encoder import run_native_encoder
-from src.onnx_fixup import fix_reshape_allowzero
+from tests.encoder_helpers import FRAME_LENGTHS, export_encoder_at_100
 
 pytestmark = pytest.mark.integration
 
@@ -21,7 +21,6 @@ CHECKPOINTS = (
     ("Qwen/Qwen3-ASR-0.6B", "5eb144179a02acc5e5ba31e748d22b0cf3e303b0"),
     ("Qwen/Qwen3-ASR-1.7B", "7278e1e70fe206f11671096ffdd38061171dd6e5"),
 )
-FRAME_LENGTHS = (1, 2, 7, 8, 9, 49, 50, 51, 74, 75, 76, 99, 100, 101, 799, 800, 801, 1600)
 
 
 @pytest.fixture
@@ -72,19 +71,7 @@ def test_pinned_checkpoint_encoder(model_id, revision, tmp_path, encoder_threads
     tower = load_audio_tower(model_id, revision)
     wrapper = EncoderWrapper(tower).eval()
     path = tmp_path / "encoder.onnx"
-    with torch.no_grad():
-        torch.onnx.export(
-            wrapper,
-            (torch.randn(1, 128, 100, generator=torch.Generator().manual_seed(100)),),
-            str(path),
-            input_names=["mel"],
-            output_names=["audio_features"],
-            dynamic_axes={"mel": {2: "time"}, "audio_features": {1: "enc_time"}},
-            opset_version=17,
-            do_constant_folding=True,
-            dynamo=False,
-        )
-    fix_reshape_allowzero(str(path))
+    export_encoder_at_100(wrapper, path)
     options = ort.SessionOptions()
     options.intra_op_num_threads = 2
     session = ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"])

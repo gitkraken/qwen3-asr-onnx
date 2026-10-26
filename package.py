@@ -14,25 +14,9 @@ import onnxruntime as ort
 
 from share_weights import external_data_files, share_external_models
 from src.embeddings import load_embed_tokens
+from src.tokenizer_assets import tokenizer_asset_names, validate_tokenizer_assets
 
 REQUIRED_METADATA = ["config.json", "preprocessor_config.json", "tokenizer.json", "tokenizer_config.json"]
-OPTIONAL_METADATA = [
-    "added_tokens.json",
-    "vocab.json",
-    "merges.txt",
-    "special_tokens_map.json",
-    "chat_template.jinja",
-    "chat_template.json",
-]
-SHARED_FILES = REQUIRED_METADATA + OPTIONAL_METADATA
-
-
-def format_size(size_bytes):
-    if size_bytes >= 1e9:
-        return f"{size_bytes / 1e9:.2f} GB"
-    if size_bytes >= 1e6:
-        return f"{size_bytes / 1e6:.1f} MB"
-    return f"{size_bytes / 1e3:.1f} KB"
 
 
 def _graph_names(suffix=""):
@@ -51,14 +35,13 @@ def _dependencies(root, names):
 def copy_file(src, dst, hardlink=False):
     src, dst = Path(src), Path(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    if hardlink:
+    if hardlink and not src.is_symlink():
         try:
             os.link(src, dst)
         except OSError:
             shutil.copy2(src, dst)
     else:
         shutil.copy2(src, dst)
-    return dst.stat().st_size
 
 
 def verify_ort_load(output_dir):
@@ -77,7 +60,7 @@ def verify_ort_load(output_dir):
 
 
 def _create_archive(root, target, names, archive_root):
-    with tarfile.open(target, "w:gz", compresslevel=1) as archive:
+    with tarfile.open(target, "w:gz", compresslevel=1, dereference=True) as archive:
         for name in sorted(names):
             archive.add(root / name, arcname=f"{archive_root}/{name}", recursive=False)
 
@@ -120,9 +103,13 @@ def _publish_artifacts(replacements):
 def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
     source = Path(input_dir).resolve()
     output = Path(output_dir).absolute()
-    resolved_output = output.resolve()
-    if source.is_relative_to(resolved_output) or resolved_output.is_relative_to(source):
-        raise ValueError("Input and output directories must be separate")
+    archives = {
+        variant: output.parent / f"{output.name}{'-int4' if variant else ''}.tar.gz" for variant in ("", "int4")
+    }
+    for target in [output, *archives.values()]:
+        resolved_target = target.resolve()
+        if source.is_relative_to(resolved_target) or resolved_target.is_relative_to(source):
+            raise ValueError(f"Input directory overlaps publication destination: {target}")
     if output.is_symlink():
         raise ValueError("Output cannot be a symlink")
     for name in REQUIRED_METADATA + ["embed_tokens.bin"]:
@@ -152,7 +139,7 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
         stage = Path(tmp)
         release = stage / output.name
         release.mkdir()
-        metadata = set(REQUIRED_METADATA + [name for name in OPTIONAL_METADATA if (source / name).is_file()])
+        metadata = {"config.json", "preprocessor_config.json"} | tokenizer_asset_names(source)
         names = set(metadata)
         for variant in variants:
             names.update(_dependencies(source, _graph_names(variant)))
@@ -171,26 +158,25 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
         if test_wavs_src is not None:
             copy_file(test_wavs_src, release / "test_wavs" / "0.wav")
             shared.add("test_wavs/0.wav")
-        complete = set(shared)
-        for variant in variants:
-            complete.update(_dependencies(release, _graph_names(variant)))
+        variant_files = {variant: _dependencies(release, _graph_names(variant)) for variant in variants}
+        complete = shared | set().union(*variant_files.values())
         for path in release.rglob("*"):
             if path.is_file() and path.relative_to(release).as_posix() not in complete:
                 path.unlink()
         if not verify_ort_load(release):
             raise ValueError("Release failed ONNX/ORT verification")
         load_embed_tokens(release)
+        validate_tokenizer_assets(release)
         replacements = [(release, output)]
         for variant in variants:
             base = output.name + ("-int4" if variant else "")
             archive_path = stage / f"{base}.tar.gz"
-            members = shared | _dependencies(release, _graph_names(variant))
+            members = shared | variant_files[variant]
             _create_archive(release, archive_path, members, base)
-            replacements.append((archive_path, output.parent / archive_path.name))
+            replacements.append((archive_path, archives[variant]))
         for variant in ("", "int4"):
             if variant not in variants:
-                base = output.name + ("-int4" if variant else "")
-                replacements.append((None, output.parent / f"{base}.tar.gz"))
+                replacements.append((None, archives[variant]))
         _publish_artifacts(replacements)
     print(f"Release directory: {output}")
     return True

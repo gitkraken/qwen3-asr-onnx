@@ -10,9 +10,7 @@ from qwen_asr.core.transformers_backend.modeling_qwen3_asr import Qwen3ASRAudioE
 
 from src.encoder_wrapper import EncoderWrapper, export_encoder
 from src.native_encoder import run_native_encoder
-from src.onnx_fixup import fix_reshape_allowzero
-
-FRAME_LENGTHS = (1, 2, 7, 8, 9, 49, 50, 51, 74, 75, 76, 99, 100, 101, 799, 800, 801, 1600)
+from tests.encoder_helpers import FRAME_LENGTHS, export_encoder_at_100
 
 
 def assert_features_match(actual, expected):
@@ -63,20 +61,7 @@ def dynamic_onnx(encoder_wrapper, native_tower, tmp_path_factory, request):
         model = SimpleNamespace(thinker=SimpleNamespace(audio_tower=native_tower))
         export_encoder(model, str(path))
     else:
-        generator = torch.Generator().manual_seed(100)
-        with torch.no_grad():
-            torch.onnx.export(
-                encoder_wrapper,
-                (torch.randn(1, 128, 100, generator=generator),),
-                str(path),
-                input_names=["mel"],
-                output_names=["audio_features"],
-                dynamic_axes={"mel": {2: "time"}, "audio_features": {1: "enc_time"}},
-                opset_version=17,
-                do_constant_folding=True,
-                dynamo=False,
-            )
-        fix_reshape_allowzero(str(path))
+        export_encoder_at_100(encoder_wrapper, path)
     options = ort.SessionOptions()
     options.intra_op_num_threads = 1
     return ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"])

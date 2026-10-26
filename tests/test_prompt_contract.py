@@ -5,8 +5,7 @@ from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
 from src import prompt
-
-OFFICIAL_CHAT_TEMPLATE = "{%- set ns = namespace(system_text=\"\") -%}\n{%- for m in messages -%}\n  {%- if m.role == 'system' -%}\n    {%- if m.content is string -%}\n      {%- set ns.system_text = ns.system_text + m.content -%}\n    {%- else -%}\n      {%- for c in m.content -%}\n        {%- if c.type == 'text' and (c.text is defined) -%}\n          {%- set ns.system_text = ns.system_text + c.text -%}\n        {%- endif -%}\n      {%- endfor -%}\n    {%- endif -%}\n  {%- endif -%}\n{%- endfor -%}\n\n{%- set ns2 = namespace(audio_tokens=\"\") -%}\n{%- for m in messages -%}\n  {%- if m.content is not string -%}\n    {%- for c in m.content -%}\n      {%- if c.type == 'audio' or ('audio' in c) or ('audio_url' in c) -%}\n        {%- set ns2.audio_tokens = ns2.audio_tokens + \"<|audio_start|><|audio_pad|><|audio_end|>\" -%}\n      {%- endif -%}\n    {%- endfor -%}\n  {%- endif -%}\n{%- endfor -%}\n\n{{- '<|im_start|>system\\n' + (ns.system_text if ns.system_text is string else '') + '<|im_end|>\\n' -}}\n{{- '<|im_start|>user\\n' + ns2.audio_tokens + '<|im_end|>\\n' -}}\n{%- if add_generation_prompt -%}\n{{- '<|im_start|>assistant\\n' -}}\n{%- endif -%}"
+from tests.tokenizer_fixtures import OFFICIAL_CHAT_TEMPLATE
 
 
 @pytest.fixture
@@ -135,7 +134,7 @@ def test_loads_official_processor_template_when_tokenizer_has_none(tmp_path, mon
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: tokenizer)
     requests = []
 
-    def cached_file(model, filename):
+    def cached_file(model, filename, **kwargs):
         requests.append((model, filename))
         return str(path)
 
@@ -165,6 +164,6 @@ def test_missing_official_template_fails_with_actionable_error(monkeypatch):
     monkeypatch.setattr(
         transformers.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: SimpleNamespace(chat_template=None)
     )
-    monkeypatch.setattr(transformers.utils, "cached_file", lambda *args: None)
+    monkeypatch.setattr(transformers.utils, "cached_file", lambda *args, **kwargs: None)
     with pytest.raises(ValueError, match="Missing official chat_template.json"):
         prompt.load_prompt_tokenizer("fixture")
