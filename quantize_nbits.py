@@ -70,6 +70,47 @@ class NpzCalibrationReader(CalibrationDataReader):
         return len(self._data)
 
 
+def validate_quantization_request(bits, block_size, algo, calib_data_path, nodes_to_exclude=None):
+    if algo not in {"rtn", "gptq"}:
+        raise ValueError(f"Unsupported quantization algorithm: {algo}")
+    if bits != 4:
+        raise ValueError(f"{algo.upper()} supports only 4-bit MatMulNBits in the supported ORT environment; got {bits}")
+    if block_size < 16 or block_size & (block_size - 1):
+        raise ValueError("MatMulNBits block size must be a power of two and at least 16")
+    if algo == "gptq":
+        if calib_data_path is None:
+            raise ValueError("--calib-data required for --algo gptq")
+        if nodes_to_exclude:
+            raise ValueError("GPTQ node exclusions are unsupported by the supported ORT algorithm; use RTN")
+
+
+def _quantized_nodes(graph):
+    for node in graph.node:
+        if node.domain == "com.microsoft" and node.op_type == "MatMulNBits":
+            yield node
+        for attribute in node.attribute:
+            if attribute.type == onnx.AttributeProto.GRAPH:
+                yield from _quantized_nodes(attribute.g)
+            elif attribute.type == onnx.AttributeProto.GRAPHS:
+                for subgraph in attribute.graphs:
+                    yield from _quantized_nodes(subgraph)
+
+
+def verify_quantized_precision(model, bits, block_size):
+    nodes = list(_quantized_nodes(model.graph))
+    if not nodes:
+        raise ValueError("No MatMulNBits operators were produced; refusing to label an unquantized model")
+    for node in nodes:
+        attributes = {attribute.name: onnx.helper.get_attribute_value(attribute) for attribute in node.attribute}
+        actual_bits = attributes.get("bits")
+        actual_block_size = attributes.get("block_size")
+        if actual_bits != bits or actual_block_size != block_size:
+            raise ValueError(
+                f"Quantized operator {node.name!r} has bits={actual_bits}, block_size={actual_block_size}; "
+                f"requested bits={bits}, block_size={block_size}. No output was written."
+            )
+
+
 def quantize_decoder(
     input_path: str,
     output_path: str,
@@ -80,66 +121,33 @@ def quantize_decoder(
     calib_data_path: str | None,
     nodes_to_exclude: list[str] | None = None,
 ) -> None:
-    """Quantize a single decoder ONNX file with MatMulNBits."""
+    validate_quantization_request(bits, block_size, algo, calib_data_path, nodes_to_exclude)
     print(f"  Loading {os.path.basename(input_path)} ...")
-
-    # neural_compressor's ONNXModel calls AutoConfig.from_pretrained() on the parent
-    # directory when it finds a config.json. Our custom model_type causes it to fail.
-    # Temporarily hide config.json during GPTQ quantization.
-    model_dir = os.path.dirname(input_path)
-    config_path = os.path.join(model_dir, "config.json")
-    config_hidden = os.path.join(model_dir, f".config.json.{os.getpid()}.hidden")
-    hide_config = algo == "gptq" and os.path.exists(config_path)
-    if hide_config:
-        os.rename(config_path, config_hidden)
-
-    try:
-        if algo == "gptq":
-            if calib_data_path is None:
-                raise ValueError("--calib-data required for --algo gptq")
-            reader = NpzCalibrationReader(calib_data_path)
-            algo_config = GPTQWeightOnlyQuantConfig(
-                calibration_data_reader=reader,
-                block_size=block_size,
-                quant_format=QuantFormat.QOperator,
-            )
-            # GPTQ requires model_path to be set — pass file path, not ModelProto
-            model_arg = input_path
-        else:
-            algo_config = RTNWeightOnlyQuantConfig(quant_format=QuantFormat.QOperator)
-            model_arg = onnx.load(input_path)
-
-        # ORT >=1.23 removed the `bits` parameter (always 4-bit); older versions require it.
-        import inspect
-
-        sig = inspect.signature(MatMulNBitsQuantizer.__init__)
-        kwargs = dict(
-            model=model_arg,
+    if algo == "gptq":
+        algo_config = GPTQWeightOnlyQuantConfig(
+            calibration_data_reader=NpzCalibrationReader(calib_data_path),
             block_size=block_size,
-            is_symmetric=False,
-            accuracy_level=accuracy_level,
-            algo_config=algo_config,
-            nodes_to_exclude=nodes_to_exclude or None,
+            quant_format=QuantFormat.QOperator,
         )
-        if "bits" in sig.parameters:
-            kwargs["bits"] = bits
-        elif bits != 4:
-            raise ValueError(f"This ORT version only supports 4-bit quantization, got bits={bits}")
-        quantizer = MatMulNBitsQuantizer(**kwargs)
-        quantizer.process()
-    finally:
-        if hide_config:
-            if os.path.exists(config_hidden):
-                os.rename(config_hidden, config_path)
-            else:
-                print(f"  WARNING: {config_hidden} missing, config.json may not be restored")
+        model_arg = input_path
+    else:
+        algo_config = RTNWeightOnlyQuantConfig(quant_format=QuantFormat.QOperator)
+        model_arg = onnx.load(input_path)
 
-    # ORT's quantizer inserts MatMulNBits (com.microsoft domain) nodes but doesn't
-    # add the required opset import. Fix this for ONNX spec compliance.
+    quantizer = MatMulNBitsQuantizer(
+        model=model_arg,
+        bits=bits,
+        block_size=block_size,
+        is_symmetric=False,
+        accuracy_level=accuracy_level,
+        algo_config=algo_config,
+        nodes_to_exclude=nodes_to_exclude or None,
+    )
+    quantizer.process()
     model = quantizer.model.model
-    ms_domains = [o for o in model.opset_import if o.domain == "com.microsoft"]
-    has_ms_ops = any(n.op_type == "MatMulNBits" for n in model.graph.node)
-    if has_ms_ops and not ms_domains:
+    verify_quantized_precision(model, bits, block_size)
+
+    if not any(opset.domain == "com.microsoft" for opset in model.opset_import):
         opset = model.opset_import.add()
         opset.domain = "com.microsoft"
         opset.version = 1
@@ -153,7 +161,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, help="Input model directory (FP32 ONNX)")
     parser.add_argument("--output", required=True, help="Output model directory")
-    parser.add_argument("--bits", type=int, default=4, choices=[4, 8], help="Quantization bits")
+    parser.add_argument(
+        "--bits",
+        type=int,
+        default=4,
+        choices=[4, 8],
+        help="Requested bits (RTN/GPTQ support 4; unsupported requests fail before output)",
+    )
     parser.add_argument("--block-size", type=int, default=64, help="Block size (group size)")
     parser.add_argument(
         "--accuracy-level",
@@ -187,6 +201,14 @@ def main():
     )
     args = parser.parse_args()
 
+    validate_quantization_request(args.bits, args.block_size, args.algo, args.calib_data, args.nodes_to_exclude)
+    for name in args.decoders:
+        if name not in {"decoder_init", "decoder_step"}:
+            raise ValueError(f"Unsupported decoder name: {name}")
+        path = os.path.join(args.input, f"{name}.onnx")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Required decoder not found: {path}")
+
     os.makedirs(args.output, exist_ok=True)
 
     # Quantize each decoder file
@@ -194,11 +216,10 @@ def main():
     quantized_names = set()
     for name in args.decoders:
         src = os.path.join(args.input, f"{name}.onnx")
-        if not os.path.exists(src):
-            print(f"  Skipping {name}.onnx (not found)")
-            continue
         dst = os.path.join(args.output, f"{name}{bits_suffix}.onnx")
-        quantize_decoder(src, dst, args.bits, args.block_size, args.accuracy_level, args.algo, args.calib_data, args.nodes_to_exclude)
+        quantize_decoder(
+            src, dst, args.bits, args.block_size, args.accuracy_level, args.algo, args.calib_data, args.nodes_to_exclude
+        )
         quantized_names.add(name)
 
     # Copy non-quantized files from input to output (encoder, tokenizer, config, etc.)
