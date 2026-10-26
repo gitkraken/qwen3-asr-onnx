@@ -18,6 +18,7 @@ from src.tokenizer_assets import (
     tokenizer_asset_names,
     validate_tokenizer_assets,
 )
+from tests.test_artifact_contract import _write_model
 from tests.tokenizer_fixtures import OFFICIAL_CHAT_TEMPLATE, save_tokenizer_assets
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -285,3 +286,79 @@ def test_archive_materializes_linked_template_bytes(tmp_path):
         assert archive.getmember("bundle/chat_template.jinja").isfile()
         archive.extractall(tmp_path / "extracted", filter="data")
     _assert_source_assets(source, tmp_path / "extracted" / "bundle")
+
+
+@pytest.mark.parametrize("script", ["quantize.py", "quantize_nbits.py"])
+@pytest.mark.parametrize("link", ["symlink", "hardlink"])
+def test_quantizer_cli_preserves_retained_tokenizer_links(tmp_path, script, link):
+    source = _source(tmp_path / "source", "embedded")
+    target = tmp_path / "target"
+    target.mkdir()
+    weight = np.ones((64, 64), dtype=np.float32) if script == "quantize_nbits.py" else None
+    for name in ["decoder_init.onnx", "decoder_step.onnx"]:
+        _write_model(source, name, external=False, weight=weight)
+    retained = tmp_path / "retained"
+    retained.mkdir()
+    before = {}
+    for name in tokenizer_asset_names(source):
+        previous = retained / name
+        previous.write_bytes(("retained-" + name).encode())
+        before[name] = previous.read_bytes()
+        if link == "symlink":
+            (target / name).symlink_to(previous)
+        else:
+            os.link(previous, target / name)
+    if script == "quantize.py":
+        command = _converter_command(tmp_path, script, source, target)
+    else:
+        command = [
+            sys.executable,
+            str(ROOT / "quantize_nbits.py"),
+            "--input",
+            str(source),
+            "--output",
+            str(target),
+            "--bits",
+            "4",
+            "--block-size",
+            "32",
+        ]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=os.environ | {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert {name: (retained / name).read_bytes() for name in before} == before
+    assert all((target / name).read_bytes() == (source / name).read_bytes() for name in tokenizer_asset_names(source))
+
+
+def test_nbits_invalid_tokenizer_rejected_before_output(tmp_path):
+    source = _source(tmp_path / "source", "jinja")
+    target = tmp_path / "target"
+    for name in ["decoder_init.onnx", "decoder_step.onnx"]:
+        _write_model(source, name, external=False)
+    (source / "chat_template.jinja").unlink()
+    command = [
+        sys.executable,
+        str(ROOT / "quantize_nbits.py"),
+        "--input",
+        str(source),
+        "--output",
+        str(target),
+        "--bits",
+        "4",
+        "--block-size",
+        "32",
+    ]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=os.environ | {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
+    )
+    assert result.returncode != 0
+    assert not target.exists()

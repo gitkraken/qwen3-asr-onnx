@@ -181,15 +181,18 @@ def _live_data_files(root):
     return live
 
 
-def _publish_data(staged, target, root):
+def _publish_data(staged, target):
+    if target.is_symlink():
+        raise ValueError("Canonical shared data cannot be a symlink; rebuild in a clean output directory")
     if target.exists():
-        identical = staged.stat().st_size == target.stat().st_size and _file_digest(staged) == _file_digest(target)
+        identical = (
+            target.is_file()
+            and staged.stat().st_size == target.stat().st_size
+            and _file_digest(staged) == _file_digest(target)
+        )
         if identical:
             return
-        if target in _live_data_files(root):
-            raise ValueError(
-                "Canonical shared data is in use with incompatible bytes; rebuild in a clean output directory"
-            )
+        raise ValueError("Canonical shared data has incompatible bytes; rebuild in a clean output directory")
     os.replace(staged, target)
 
 
@@ -252,7 +255,7 @@ def share_external_models(model_dir, suffix=None):
                 os.fsync(stream.fileno())
         _validate_models(stage, names)
         _validate_runtime_models(stage, names)
-        _publish_data(stage / shared_name, root / shared_name, root)
+        _publish_data(stage / shared_name, root / shared_name)
         for name in names:
             os.replace(stage / name, root / name)
         _validate_models(root, names)

@@ -50,7 +50,12 @@ from onnxruntime.quantization.matmul_nbits_quantizer import (
 from onnxruntime.quantization.quant_utils import QuantFormat
 
 from share_weights import external_data_files, get_external_info, model_tensors
-from src.tokenizer_assets import copy_tokenizer_assets, tokenizer_asset_names
+from src.tokenizer_assets import (
+    TOKENIZER_FILES,
+    copy_tokenizer_assets,
+    tokenizer_asset_names,
+    validate_tokenizer_assets,
+)
 
 
 class NpzCalibrationReader(CalibrationDataReader):
@@ -252,6 +257,9 @@ def main():
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Required decoder not found: {path}")
 
+    if tokenizer_asset_names(args.input):
+        validate_tokenizer_assets(args.input)
+
     os.makedirs(args.output, exist_ok=True)
 
     # Quantize each decoder file
@@ -269,6 +277,8 @@ def main():
     # Skip if input == output (in-place quantization).
     if os.path.realpath(args.input) != os.path.realpath(args.output):
         for fname in os.listdir(args.input):
+            if fname in TOKENIZER_FILES:
+                continue
             # Skip quantized decoder files (suffixed .int4/.int8 variants)
             if any(fname.startswith(f"{n}{bits_suffix}") for n in ("decoder_init", "decoder_step")):
                 continue

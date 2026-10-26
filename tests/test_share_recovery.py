@@ -333,3 +333,32 @@ def test_shared_quantized_variants_pass_real_cpu_sessions(tmp_path, dtype, suffi
     assert share.share_external_models(tmp_path, suffix=suffix)
     for name in share._decoder_filenames(suffix):
         np.testing.assert_array_equal(_run_model(tmp_path / name, feed)[0], before[0])
+
+
+@pytest.mark.parametrize("inline", [False, True])
+def test_conflicting_canonical_data_is_preserved(tmp_path, inline):
+    expected = _pair(tmp_path, inline=inline)
+    path = tmp_path / "decoder_weights.data"
+    path.write_bytes(b"independently retained canonical bytes")
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()}
+    with pytest.raises(ValueError, match="incompatible"):
+        share.share_external_models(tmp_path)
+    assert {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()} == before
+    _assert_pair(tmp_path, expected)
+
+
+def test_identical_canonical_symlink_rejected_before_graph_publication(tmp_path):
+    expected = _pair(tmp_path)
+    reference = tmp_path / "reference"
+    reference.mkdir()
+    _pair(reference)
+    assert share.share_external_models(reference)
+    retained = tmp_path / "retained.bin"
+    retained.write_bytes((reference / "decoder_weights.data").read_bytes())
+    shutil.rmtree(reference)
+    (tmp_path / "decoder_weights.data").symlink_to(retained)
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()}
+    with pytest.raises(ValueError):
+        share.share_external_models(tmp_path)
+    assert {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()} == before
+    _assert_pair(tmp_path, expected)

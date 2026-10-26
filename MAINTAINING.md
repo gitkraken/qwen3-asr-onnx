@@ -92,7 +92,7 @@ are alternatives. The release and archives are staged and validated before
 replacing a prior usable release. Every publication and obsolete-archive removal
 destination must be separate from the source. The shared tokenizer-asset contract
 preserves embedded/JSON/Jinja templates across conversion and archiving, removes
-stale destination template assets, and requires a locally renderable ASR prompt
+stale destination template assets when the source has tokenizer assets, and requires a locally renderable ASR prompt
 before a package can be published. An archive or validation failure is a failed
 command. Kepler continues using its own manifest-driven publisher.
 
@@ -106,8 +106,9 @@ publication. The supported q4 and q4f16 CPU paths are covered by real quantized
 fixtures; missing kernels on another target need an explicit reviewed exception. Those replacements are individually
 atomic; the filesystem does not provide a multi-file transaction. A retry must
 validate the real graphs and bytes before declaring an already-shared result.
-An existing canonical file with incompatible live references requires an
-explicit rebuild error rather than being overwritten.
+Any existing canonical file with incompatible bytes requires an explicit rebuild
+error rather than being overwritten, even when no live graph refers to it.
+Canonical symlink entries are rejected before graph publication.
 
 Successful conventional decoder exports retain the two graph files and canonical
 shared data file. Temporary files owned by the conversion and unreferenced

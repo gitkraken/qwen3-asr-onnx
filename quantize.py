@@ -22,7 +22,12 @@ import tempfile
 import onnx
 from onnxruntime.quantization import QuantType, quantize_dynamic
 
-from src.tokenizer_assets import copy_tokenizer_assets, tokenizer_asset_names, validate_tokenizer_assets
+from src.tokenizer_assets import (
+    TOKENIZER_FILES,
+    copy_tokenizer_assets,
+    tokenizer_asset_names,
+    validate_tokenizer_assets,
+)
 
 ONNX_FILES = ["encoder.onnx", "decoder_init.onnx", "decoder_step.onnx"]
 
@@ -192,6 +197,8 @@ def main():
     if os.path.realpath(args.input) != os.path.realpath(args.output):
         print("\nCopying non-quantized files...")
         for fname in os.listdir(args.input):
+            if fname in TOKENIZER_FILES:
+                continue
             # Skip quantized variants
             if suffix in fname:
                 continue
