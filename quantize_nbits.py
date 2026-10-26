@@ -247,7 +247,7 @@ def main():
         "--decoders",
         nargs="+",
         default=["decoder_init", "decoder_step"],
-        help="Which decoder files to quantize",
+        help="Model file stems to quantize (default: decoder_init decoder_step)",
     )
     parser.add_argument(
         "--nodes-to-exclude",
@@ -259,8 +259,8 @@ def main():
 
     validate_quantization_request(args.bits, args.block_size, args.algo, args.calib_data, args.nodes_to_exclude)
     for name in args.decoders:
-        if name not in {"decoder_init", "decoder_step"}:
-            raise ValueError(f"Unsupported decoder name: {name}")
+        if not name or name in {".", ".."} or any(character in name for character in "/\\:"):
+            raise ValueError(f"Unsafe model name: {name}")
         path = os.path.join(args.input, f"{name}.onnx")
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Required decoder not found: {path}")
@@ -273,7 +273,7 @@ def main():
         fname
         for fname in os.listdir(args.input)
         if fname not in TOKENIZER_FILES
-        and not any(fname.startswith(f"{name}{bits_suffix}") for name in ("decoder_init", "decoder_step"))
+        and not any(fname.startswith(f"{name}{bits_suffix}") for name in args.decoders)
         and os.path.isfile(os.path.join(args.input, fname))
     }
     generated_graphs = {f"{name}{bits_suffix}.onnx" for name in args.decoders}

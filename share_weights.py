@@ -153,6 +153,8 @@ def validate_generated_destinations(output, names):
 def copy_artifact_entry(source, output, name):
     root = Path(output).resolve()
     destination = Path(output) / name
+    if not destination.parent.resolve().is_relative_to(root):
+        raise ValueError(f"Artifact destination escapes output directory: {name}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     if not destination.parent.resolve().is_relative_to(root):
         raise ValueError(f"Artifact destination escapes output directory: {name}")
@@ -238,7 +240,13 @@ def _live_data_files(root, excluded):
     live = set()
     for path in root.rglob("*.onnx"):
         if path not in excluded:
-            live.update(external_data_files(path))
+            try:
+                live.update(external_data_files(path))
+            except Exception as error:
+                raise ValueError(
+                    f"Cannot inventory independent graph {path}; preserve it and repair its references "
+                    "or move abandoned staging outside the model directory before retrying."
+                ) from error
     return live
 
 
@@ -307,7 +315,8 @@ def share_external_models(model_dir, suffix=None):
         _validate_runtime_models(root, names)
         _cleanup_data(root, names, live)
         return True
-    with tempfile.TemporaryDirectory(prefix=".share-", dir=root) as tmp:
+    # A process exit must not leave transient graphs inside the recursive consumer inventory.
+    with tempfile.TemporaryDirectory(prefix=".share-", dir=root.parent) as tmp:
         stage = Path(tmp)
         _write_shared_data(storage, root, stage / shared_name)
         for model, name in zip(models, names):

@@ -321,3 +321,76 @@ def test_quantization_replaces_stale_output_template(tmp_path):
     assert build_prompt_ids(2, load_prompt_tokenizer(str(output), local_files_only=True)) == build_prompt_ids(
         2, load_prompt_tokenizer(str(inputs), local_files_only=True)
     )
+
+
+@pytest.mark.parametrize("inplace", [False, True])
+@pytest.mark.parametrize("name", ["encoder", "custom_projection"])
+def test_quantize_safe_model_leaf_real_command(tmp_path, name, inplace):
+    from tests.test_artifact_contract import _write_model
+
+    source = tmp_path / "input"
+    source.mkdir()
+    _write_model(source, name + ".onnx", weight=np.arange(2048, dtype=np.float32).reshape(128, 16) / 2048)
+    (source / "config.json").write_text("{}")
+    _write_model(source, name + ".int4.onnx")
+    if inplace:
+        (source / (name + ".int4.onnx")).rename(source / (name + ".int4.onnx.bak"))
+    output = source if inplace else tmp_path / "output"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "quantize_nbits.py"),
+            "--input",
+            str(source),
+            "--output",
+            str(output),
+            "--bits",
+            "4",
+            "--block-size",
+            "64",
+            "--accuracy-level",
+            "4",
+            "--decoders",
+            name,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    graph = onnx.load(output / (name + ".int4.onnx"))
+    nodes = [n for n in graph.graph.node if n.op_type == "MatMulNBits"]
+    assert nodes
+    assert json.loads((output / "config.json").read_text())["quantization"][name] == "int4_rtn_block64_al4"
+
+
+@pytest.mark.parametrize(
+    "name", ["", ".", "..", "../outside/encoder", "/tmp/encoder", "sub/encoder", "sub\\encoder", "C:encoder"]
+)
+def test_unsafe_model_name_is_rejected_before_output(tmp_path, name):
+    inputs, _ = source(tmp_path)
+    output = tmp_path / "output"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "quantize_nbits.py"),
+            "--input",
+            str(inputs),
+            "--output",
+            str(output),
+            "--bits",
+            "4",
+            "--block-size",
+            "64",
+            "--accuracy-level",
+            "4",
+            "--decoders",
+            name,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode != 0
+    assert "Unsafe model name" in result.stderr
+    assert not output.exists()

@@ -7,16 +7,17 @@ import os
 import shutil
 import tarfile
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import onnx
 import onnxruntime as ort
 
 from share_weights import graph_file_closure, share_external_models, transport_graph_files
+from src.artifact_metadata import MODEL_METADATA_FILES
 from src.embeddings import load_embed_tokens
 from src.tokenizer_assets import tokenizer_asset_names, validate_tokenizer_assets
 
-REQUIRED_METADATA = ["config.json", "preprocessor_config.json", "tokenizer.json", "tokenizer_config.json"]
+REQUIRED_METADATA = [*MODEL_METADATA_FILES, "tokenizer.json", "tokenizer_config.json"]
 
 
 def _graph_names(suffix=""):
@@ -57,6 +58,43 @@ def _create_archive(root, target, names, archive_root):
             archive.add(root / name, arcname=f"{archive_root}/{name}", recursive=False)
 
 
+def _validate_archive_target(target, archive_root, variant):
+    if not target.exists() and not target.is_symlink():
+        return
+    if target.is_symlink() or not target.is_file() or target.stat().st_nlink > 1:
+        raise ValueError(f"Archive destination is not an owned regular archive: {target}")
+    required = set(REQUIRED_METADATA) | {"embed_tokens.bin", *_graph_names(variant)}
+    seen = set()
+    try:
+        with tarfile.open(target, "r|gz") as archive:
+            for member in archive:
+                path = PurePosixPath(member.name)
+                if (
+                    not member.isfile()
+                    or path.is_absolute()
+                    or ".." in path.parts
+                    or "\\" in member.name
+                    or not path.parts
+                    or path.parts[0] != archive_root
+                    or len(path.parts) < 2
+                ):
+                    raise ValueError("Unexpected archive member")
+                name = path.relative_to(archive_root).as_posix()
+                if name in seen:
+                    raise ValueError("Duplicate archive member")
+                seen.add(name)
+                if name in MODEL_METADATA_FILES:
+                    if member.size > 1024 * 1024:
+                        raise ValueError("Archive metadata exceeds 1 MiB")
+                    stream = archive.extractfile(member)
+                    if stream is None or not isinstance(json.loads(stream.read()), dict):
+                        raise ValueError("Archive metadata must be a JSON object")
+        if not required <= seen:
+            raise ValueError("Archive lacks required model artifacts")
+    except (OSError, tarfile.TarError, ValueError) as error:
+        raise ValueError(f"Unrecognized archive destination {target}; preserve it or choose another output") from error
+
+
 def _publish_artifacts(replacements):
     backup = Path(tempfile.mkdtemp(prefix=".release-backup-", dir=replacements[0][1].parent))
     saved = []
@@ -68,9 +106,8 @@ def _publish_artifacts(replacements):
                 old = backup / str(index)
                 os.replace(target, old)
                 saved.append((old, target))
-            if source is not None:
-                os.replace(source, target)
-                installed.append(target)
+            os.replace(source, target)
+            installed.append(target)
         clean = True
     except BaseException:
         try:
@@ -119,6 +156,16 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
         for name in _graph_names(variant):
             if not (source / name).is_file():
                 raise ValueError(f"Incomplete {variant or 'FP32'} variant: {name}")
+    for variant, target in archives.items():
+        if variant not in variants:
+            if target.exists() or target.is_symlink():
+                raise ValueError(
+                    f"Inactive variant archive already exists: {target}; preserve it and choose a clean output "
+                    "or move it aside explicitly before retrying"
+                )
+        else:
+            archive_root = output.name + ("-int4" if variant else "")
+            _validate_archive_target(target, archive_root, variant)
     embed = load_embed_tokens(source, output_dtype="float16")
     sidecar = source / "embed_tokens.fp16.bin"
     if sidecar.exists():
@@ -142,7 +189,7 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
         stage = Path(tmp)
         release = stage / output.name
         release.mkdir()
-        metadata = {"config.json", "preprocessor_config.json"} | tokenizer_asset_names(source)
+        metadata = set(MODEL_METADATA_FILES) | tokenizer_asset_names(source)
         names = set(metadata)
         names.update(graph_files)
         for name in sorted(names):
@@ -176,9 +223,6 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
             members = shared | variant_files[variant]
             _create_archive(release, archive_path, members, base)
             replacements.append((archive_path, archives[variant]))
-        for variant in ("", "int4"):
-            if variant not in variants:
-                replacements.append((None, archives[variant]))
         _publish_artifacts(replacements)
     print(f"Release directory: {output}")
     return True

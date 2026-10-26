@@ -591,3 +591,20 @@ def test_quantizer_rejects_linked_generated_graph_before_writes(tmp_path, script
     assert "destination conflict" in result.stdout + result.stderr
     assert retained.read_bytes() == b"retained graph"
     assert not (target / f"decoder_step.{suffix}.onnx").exists()
+
+
+@pytest.mark.parametrize("script", ["convert_fp16.py", "quantize_static.py"])
+def test_conversion_to_package_transports_metadata(tmp_path, script):
+    import package as pack
+
+    source = _source(tmp_path / "source", "embedded")
+    (source / "preprocessor_config.json").write_text('{"feature_size": 128, "sampling_rate": 16000}\n')
+    before = {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+    output = tmp_path / "converted"
+    result = subprocess.run(
+        _converter_command(tmp_path, script, source, output), capture_output=True, text=True, timeout=90
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (output / "preprocessor_config.json").read_bytes() == before[Path("preprocessor_config.json")]
+    assert pack.package(output, tmp_path / "release")
+    assert {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()} == before

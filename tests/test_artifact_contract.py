@@ -191,21 +191,24 @@ def test_legacy_metadata_requires_unambiguous_fp32_bytes(tmp_path):
 def test_publication_failure_restores_release_and_archives(tmp_path, monkeypatch):
     source = _release_input(tmp_path / "source")
     output = tmp_path / "release"
-    output.mkdir()
-    (output / "sentinel").write_text("old")
+    assert pack.package(source, output)
     previous_archive = tmp_path / "release.tar.gz"
-    previous_archive.write_bytes(b"old archive")
+    archive_bytes = previous_archive.read_bytes()
+    previous = {p.relative_to(output): p.read_bytes() for p in output.rglob("*") if p.is_file()}
     original_replace = pack.os.replace
+    reached = []
 
     def injected(source, target):
         if Path(target) == previous_archive and ".package-" in str(source):
+            reached.append(target)
             raise OSError("injected archive publication failure")
         original_replace(source, target)
 
     monkeypatch.setattr(pack.os, "replace", injected)
     assert not pack.package(str(source), str(output))
-    assert (output / "sentinel").read_text() == "old"
-    assert previous_archive.read_bytes() == b"old archive"
+    assert reached == [previous_archive]
+    assert {p.relative_to(output): p.read_bytes() for p in output.rglob("*") if p.is_file()} == previous
+    assert previous_archive.read_bytes() == archive_bytes
 
 
 def test_converter_rejects_overflow_and_preserves_existing_sidecar(tmp_path):
@@ -449,3 +452,67 @@ def test_package_rejects_encoder_dependency_on_decoder_canonical_data(tmp_path, 
     assert "destination conflict: decoder_weights.data" in capsys.readouterr().out
     assert (output / "sentinel").read_text() == "previous release"
     assert not (tmp_path / "release.tar.gz").exists()
+
+
+@pytest.mark.parametrize("kind", ["file", "directory"])
+def test_absent_archive_is_preserved(tmp_path, kind):
+    source = _release_input(tmp_path / "source")
+    target = tmp_path / "release-int4.tar.gz"
+    if kind == "directory":
+        target.mkdir()
+        sentinel = target / "foreign"
+    else:
+        sentinel = target
+    sentinel.write_bytes(b"foreign bytes")
+    assert not pack.package(source, tmp_path / "release")
+    assert not (tmp_path / "release").exists()
+    assert sentinel.read_bytes() == b"foreign bytes"
+
+
+def test_emitted_archive_directory_is_rejected_before_publication(tmp_path):
+    source = _release_input(tmp_path / "source")
+    target = tmp_path / "release.tar.gz"
+    target.mkdir()
+    (target / "foreign").write_bytes(b"foreign bytes")
+    assert not pack.package(source, tmp_path / "release")
+    assert not (tmp_path / "release").exists()
+    assert (target / "foreign").read_bytes() == b"foreign bytes"
+
+
+@pytest.mark.parametrize("kind", ["plain-file", "symlink", "foreign-tar", "tar-link", "large-metadata"])
+def test_unowned_archive_is_rejected_before_publication(tmp_path, kind):
+    import io
+
+    source = _release_input(tmp_path / "source")
+    target = tmp_path / "release.tar.gz"
+    retained = tmp_path / "retained"
+    retained.write_bytes(b"foreign bytes")
+    if kind == "plain-file":
+        target.write_bytes(b"foreign bytes")
+    elif kind == "symlink":
+        target.symlink_to(retained)
+    else:
+        with tarfile.open(target, "w:gz") as archive:
+            entry = tarfile.TarInfo("release/config.json" if kind == "large-metadata" else "foreign/file")
+            if kind == "tar-link":
+                entry.type = tarfile.SYMTYPE
+                entry.linkname = str(retained)
+                archive.addfile(entry)
+            else:
+                data = b" " * (1024 * 1024 + 1) if kind == "large-metadata" else b"foreign"
+                entry.size = len(data)
+                archive.addfile(entry, io.BytesIO(data))
+    before = target.read_bytes()
+    assert not pack.package(source, tmp_path / "release")
+    assert not (tmp_path / "release").exists()
+    assert target.read_bytes() == before
+    assert retained.read_bytes() == b"foreign bytes"
+
+
+def test_publication_can_replace_recognized_archive(tmp_path):
+    source = _release_input(tmp_path / "source")
+    output = tmp_path / "release"
+    assert pack.package(source, output)
+    assert pack.package(source, output)
+    for name in ("encoder.onnx", "decoder_init.onnx", "decoder_step.onnx"):
+        np.testing.assert_array_equal(_ort_result(source / name), _ort_result(output / name))

@@ -1,5 +1,8 @@
 import builtins
+import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -394,8 +397,9 @@ def test_unrelated_invalid_graph_rejected_before_decoder_publication(tmp_path, a
     graph.write_bytes(b"invalid unrelated graph")
     before = {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
     for _ in range(2):
-        with pytest.raises(DecodeError, match="parsing"):
+        with pytest.raises(ValueError, match="Cannot inventory independent graph") as caught:
             share.share_external_models(tmp_path)
+        assert isinstance(caught.value.__cause__, DecodeError)
         assert {
             path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()
         } == before
@@ -403,3 +407,106 @@ def test_unrelated_invalid_graph_rejected_before_decoder_publication(tmp_path, a
     assert share.share_external_models(tmp_path)
     _assert_pair(tmp_path, expected)
     assert not list(tmp_path.glob("*.onnx.data"))
+
+
+ROOT = Path(share.__file__).resolve().parent
+
+
+@pytest.mark.parametrize("suffix", [None, "int4", "q4f16"])
+@pytest.mark.parametrize("foreign", [False, True])
+def test_abrupt_exit_retry_preserves_models_and_stage_contract(tmp_path, suffix, foreign):
+    model = tmp_path / "models"
+    model.mkdir()
+    names = share._decoder_filenames(suffix)
+    for name in names:
+        _write_model(model, name, external=True)
+    expected = {name: _ort_result(model / name) for name in names}
+    retained = {}
+    if foreign:
+        shutil.copy2(model / names[0], model / "foreign.onnx")
+        nested = model / ".share-foreign"
+        nested.mkdir()
+        _write_model(nested, "aux.onnx", external=True)
+        retained = {
+            p.relative_to(model): p.read_bytes()
+            for p in [model / "foreign.onnx", model / (names[0] + ".data"), *nested.iterdir()]
+        }
+    code = """import os, sys, share_weights as s
+real = s._publish_data
+def crash(staged, target):
+    real(staged, target)
+    os._exit(77)
+s._publish_data = crash
+s.share_external_models(sys.argv[1], suffix=sys.argv[2] or None)
+"""
+    env = os.environ | {"PYTHONPATH": str(ROOT), "PYTHONDONTWRITEBYTECODE": "1"}
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(model), suffix or ""], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 77, result.stdout + result.stderr
+    for name, values in expected.items():
+        np.testing.assert_array_equal(_ort_result(model / name), values)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys,share_weights as s;s.share_external_models(sys.argv[1],suffix=sys.argv[2] or None)",
+            str(model),
+            suffix or "",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    for name, values in expected.items():
+        np.testing.assert_array_equal(_ort_result(model / name), values)
+    if foreign:
+        for name, data in retained.items():
+            assert (model / name).read_bytes() == data
+        _ort_result(model / "foreign.onnx")
+        _ort_result(model / ".share-foreign" / "aux.onnx")
+    else:
+        selected = {*names, share._shared_data_name(suffix)}
+        assert {p.name for p in model.iterdir()} == selected
+        copied = tmp_path / "copied"
+        copied.mkdir()
+        for name in selected:
+            shutil.move(model / name, copied / name)
+        assert list(model.iterdir()) == []
+        for name, values in expected.items():
+            np.testing.assert_array_equal(_ort_result(copied / name), values)
+
+
+def test_copy_containment_precedes_mkdir(tmp_path):
+    source, output, outside = (tmp_path / name for name in ("source", "output", "outside"))
+    (source / "sub" / "new").mkdir(parents=True)
+    (source / "sub" / "new" / "file").write_bytes(b"file")
+    output.mkdir()
+    outside.mkdir()
+    (output / "sub").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="escapes"):
+        share.copy_artifact_entry(source, output, "sub/new/file")
+    assert list(outside.iterdir()) == []
+
+
+def test_legacy_unmarked_staging_is_preserved_and_diagnosed(tmp_path):
+    _pair(tmp_path)
+    abandoned = tmp_path / ".share-legacy"
+    abandoned.mkdir()
+    _write_model(abandoned, "decoder_init.onnx", external=True)
+    (abandoned / "decoder_init.onnx.data").unlink()
+    before = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    with pytest.raises(ValueError) as caught:
+        share.share_external_models(tmp_path)
+    assert str(abandoned / "decoder_init.onnx") in str(caught.value)
+    assert "before retrying" in str(caught.value)
+    assert {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
+
+
+def test_parent_traversal_is_rejected_before_mkdir(tmp_path):
+    output = tmp_path / "output"
+    with pytest.raises(ValueError, match="escapes"):
+        share.copy_artifact_entry(tmp_path, output, "../outside/new/file")
+    assert list(tmp_path.iterdir()) == []

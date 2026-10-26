@@ -28,6 +28,7 @@ from share_weights import (
     validate_generated_destinations,
     write_artifact_json,
 )
+from src.artifact_metadata import MODEL_METADATA_FILES
 from src.tokenizer_assets import copy_tokenizer_assets, tokenizer_asset_names, validate_tokenizer_assets
 
 
@@ -88,7 +89,7 @@ def main():
     generated = converted | {f"{name}.data" for name in converted}
     if {"decoder_init.onnx", "decoder_step.onnx"} <= converted and not args.no_share_weights:
         generated.add("decoder_weights.data")
-    files = {"embed_tokens.bin", "config.json"}
+    files = {"embed_tokens.bin", *MODEL_METADATA_FILES}
     if os.path.isfile(os.path.join(args.input, "encoder.onnx")) and "encoder.onnx" not in converted:
         files.update(transport_graph_files(args.input, ["encoder.onnx"], generated, {"config.json"}))
     files.difference_update(tokenizer_asset_names(args.input))

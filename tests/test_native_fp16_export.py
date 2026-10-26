@@ -1,15 +1,18 @@
+import copy
 import sys
 from types import SimpleNamespace
 
 import numpy as np
 import onnx
 import onnxruntime as ort
+import pytest
 import torch
 from qwen_asr.core.transformers_backend.configuration_qwen3_asr import Qwen3ASRAudioEncoderConfig
 from qwen_asr.core.transformers_backend.modeling_qwen3_asr import Qwen3ASRAudioEncoder
 
 import export
 import export_encoder_native_fp16 as native_fp16
+from src.native_encoder import run_native_encoder
 from tests.encoder_helpers import FRAME_LENGTHS
 
 
@@ -29,6 +32,8 @@ def test_native_fp16_main_exports_dynamic_fp32_io(tmp_path, monkeypatch, capsys)
         )
         config._attn_implementation = "eager"
         model = SimpleNamespace(thinker=SimpleNamespace(audio_tower=Qwen3ASRAudioEncoder(config).eval()))
+
+        reference = copy.deepcopy(model.thinker.audio_tower).half()
 
         def load_tiny_model(model_name, dtype):
             assert model_name == "fixture/tiny"
@@ -74,4 +79,20 @@ def test_native_fp16_main_exports_dynamic_fp32_io(tmp_path, monkeypatch, capsys)
         expected_tokens = (frames // 100) * 13 + ((frames % 100) + 7) // 8
         assert features.shape == (1, expected_tokens, 16)
         assert features.dtype == np.float32
-        assert np.isfinite(features).all()
+        with torch.no_grad(), torch.amp.autocast("cpu", dtype=torch.float16):
+            expected = run_native_encoder(reference, torch.from_numpy(mel).half()).float().numpy()
+        _assert_fp16_features(features, expected)
+        with pytest.raises(AssertionError):
+            _assert_fp16_features(features * 1.01, expected)
+        with pytest.raises(AssertionError):
+            _assert_fp16_features(np.zeros_like(features), expected)
+
+
+def _assert_fp16_features(actual, expected):
+    assert actual.shape == expected.shape
+    assert np.isfinite(actual).all() and np.isfinite(expected).all()
+    # Tiny CPU fixtures show up to 3.66 epsilon absolute and 1.83 epsilon relative L2
+    # from half rounding across two attention layers; these budgets are not release tolerances.
+    epsilon = np.finfo(np.float16).eps
+    assert np.max(np.abs(actual - expected)) < 5 * epsilon
+    assert np.linalg.norm(actual - expected) / np.linalg.norm(expected) < 3 * epsilon

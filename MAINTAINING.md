@@ -86,6 +86,8 @@ is an error. FP16 input is preserved when repackaged; FP32 conversion must remai
 finite. The raw binary is separate from ONNX session creation and needs its own
 validation.
 
+Converters preserve available configuration and preprocessing metadata from the
+shared model-metadata inventory; graph-only conversions remain supported.
 Converters, quantizers and packages transport each ONNX graph with its external-data
 closure. They reject dependencies that would be replaced by a generated graph or
 rewritten metadata before writing output. Decoder canonical data may be reused by
@@ -96,8 +98,12 @@ link cannot change retained bytes.
 Packages require complete graph sets plus their actual external-data references,
 configuration, tokenizer and embeddings. Inline, per-decoder and shared weights
 are alternatives. The release and archives are staged and validated before
-replacing a prior usable release. Every publication and obsolete-archive removal
-destination must be separate from the source. The shared tokenizer-asset contract
+replacing a prior usable release. Every publication destination must be separate from the source. Existing emitted
+archives must be regular, recognizable model archives with the expected root and
+required artifacts; inspection never extracts members or follows archive links.
+An archive for an inactive variant is preserved and causes a preflight error, so
+a successful release cannot leave an ambiguous stale variant beside it. Choose a
+clean output name or move that file aside explicitly before retrying. The shared tokenizer-asset contract
 preserves embedded/JSON/Jinja templates across conversion and archiving, removes
 stale destination template assets when the source has tokenizer assets, and requires a locally renderable ASR prompt
 before a package can be published. An archive or validation failure is a failed
@@ -121,8 +127,13 @@ error rather than being overwritten, even when no live graph refers to it.
 Canonical symlink entries are rejected before graph publication.
 
 Successful conventional decoder exports retain the two graph files and canonical
-shared data file. Temporary files owned by the conversion and unreferenced
-conventional per-decoder data are cleaned on retry after checking nested graph references. Arbitrary data
+shared data file. Unreferenced conventional per-decoder data is cleaned on retry after checking
+nested graph references. Sharing stages in a sibling directory so abrupt process
+exit cannot contaminate the model inventory or leave directories in the canonical
+triplet handed to Kepler. A terminated process can leave that sibling behind;
+only remove it after establishing ownership. Historical unmarked staging inside
+a model directory is preserved and inventoried like other foreign content;
+invalid references produce an actionable error before publication. Arbitrary data
 dependencies are retained because a reference does not establish exclusive
 ownership; unreferenced data with custom original names may remain in the working directory;
 keep it until its ownership is known. Packaging includes only the verified file
