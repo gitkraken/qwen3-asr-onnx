@@ -112,7 +112,9 @@ def test_pinned_checkpoint_encoder(model_id, revision, tmp_path, encoder_threads
             print(json.dumps(row), flush=True)
             for actual, reference in [(eager, native), (exported, native), (exported, eager)]:
                 np.testing.assert_allclose(actual, reference, atol=1e-4, rtol=1e-4)
-                assert feature_error(actual, reference)["relative_l2"] < 1e-4
+                error = feature_error(actual, reference)
+                assert error["max_abs"] <= 1e-4
+                assert error["relative_l2"] < 1e-4
     report = {
         "model": model_id,
         "revision": revision,

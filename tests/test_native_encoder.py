@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import numpy as np
 import onnxruntime as ort
 import pytest
@@ -5,7 +7,7 @@ import torch
 from qwen_asr.core.transformers_backend.configuration_qwen3_asr import Qwen3ASRAudioEncoderConfig
 from qwen_asr.core.transformers_backend.modeling_qwen3_asr import Qwen3ASRAudioEncoder
 
-from src.encoder_wrapper import EncoderWrapper
+from src.encoder_wrapper import EncoderWrapper, export_encoder
 from src.native_encoder import run_native_encoder
 from src.onnx_fixup import fix_reshape_allowzero
 
@@ -53,23 +55,27 @@ def encoder_wrapper(native_tower):
     return EncoderWrapper(native_tower).eval()
 
 
-@pytest.fixture(scope="module")
-def dynamic_onnx(encoder_wrapper, tmp_path_factory):
+@pytest.fixture(scope="module", params=["trace100", "export_helper997"])
+def dynamic_onnx(encoder_wrapper, native_tower, tmp_path_factory, request):
     path = tmp_path_factory.mktemp("native-encoder") / "encoder.onnx"
-    generator = torch.Generator().manual_seed(100)
-    with torch.no_grad():
-        torch.onnx.export(
-            encoder_wrapper,
-            (torch.randn(1, 128, 100, generator=generator),),
-            str(path),
-            input_names=["mel"],
-            output_names=["audio_features"],
-            dynamic_axes={"mel": {2: "time"}, "audio_features": {1: "enc_time"}},
-            opset_version=17,
-            do_constant_folding=True,
-            dynamo=False,
-        )
-    fix_reshape_allowzero(str(path))
+    if request.param == "export_helper997":
+        model = SimpleNamespace(thinker=SimpleNamespace(audio_tower=native_tower))
+        export_encoder(model, str(path))
+    else:
+        generator = torch.Generator().manual_seed(100)
+        with torch.no_grad():
+            torch.onnx.export(
+                encoder_wrapper,
+                (torch.randn(1, 128, 100, generator=generator),),
+                str(path),
+                input_names=["mel"],
+                output_names=["audio_features"],
+                dynamic_axes={"mel": {2: "time"}, "audio_features": {1: "enc_time"}},
+                opset_version=17,
+                do_constant_folding=True,
+                dynamo=False,
+            )
+        fix_reshape_allowzero(str(path))
     options = ort.SessionOptions()
     options.intra_op_num_threads = 1
     return ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"])
@@ -86,7 +92,7 @@ def test_wrapper_matches_native(native_tower, encoder_wrapper, frames):
 
 
 @pytest.mark.parametrize("frames", FRAME_LENGTHS)
-def test_onnx_traced_at_100_matches_native(native_tower, encoder_wrapper, dynamic_onnx, frames):
+def test_dynamic_onnx_matches_native(native_tower, encoder_wrapper, dynamic_onnx, frames):
     mel = torch.randn(1, 128, frames, generator=torch.Generator().manual_seed(frames))
     with torch.no_grad():
         reference = run_native_encoder(native_tower, mel).numpy()
@@ -112,5 +118,13 @@ def test_native_reference_cleans_up_hooks_after_error(native_tower, monkeypatch)
 
     monkeypatch.setattr(native_tower, "forward", fail_forward)
     with pytest.raises(RuntimeError, match="native forward failed"):
+        run_native_encoder(native_tower, torch.zeros(1, 128, 50))
+    assert [dict(layer.self_attn._forward_pre_hooks) for layer in native_tower.layers] == before
+
+
+def test_native_reference_rejects_non_tensor_output(native_tower, monkeypatch):
+    before = [dict(layer.self_attn._forward_pre_hooks) for layer in native_tower.layers]
+    monkeypatch.setattr(native_tower, "forward", lambda *args, **kwargs: SimpleNamespace(last_hidden_state=None))
+    with pytest.raises(TypeError, match="must return a tensor"):
         run_native_encoder(native_tower, torch.zeros(1, 128, 50))
     assert [dict(layer.self_attn._forward_pre_hooks) for layer in native_tower.layers] == before

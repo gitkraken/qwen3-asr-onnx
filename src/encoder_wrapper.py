@@ -107,8 +107,8 @@ class EncoderWrapper(nn.Module):
     Reimplements the Qwen3ASRAudioEncoder forward pass with windowed
     convolution and windowed attention, using ONNX-traceable operations.
 
-    All control flow is branch-free (no data-dependent if/else) to ensure
-    correct tracing under torch.export / torch.onnx.export.
+    Tensor-based shape calculations preserve dynamic time lengths with the
+    legacy ONNX exporter.
     """
 
     def __init__(self, audio_tower):
@@ -243,6 +243,7 @@ def export_encoder(
             },
             opset_version=opset_version,
             do_constant_folding=True,
+            dynamo=False,
         )
 
     from .onnx_fixup import fix_reshape_allowzero

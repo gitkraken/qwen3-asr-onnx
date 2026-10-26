@@ -343,6 +343,7 @@ def export_decoder_init(
             dynamic_axes=dynamic_axes,
             opset_version=opset_version,
             do_constant_folding=True,
+            dynamo=False,
         )
 
     from .onnx_fixup import fix_reshape_allowzero
@@ -414,6 +415,7 @@ def export_decoder_step(
             dynamic_axes=dynamic_axes,
             opset_version=opset_version,
             do_constant_folding=True,
+            dynamo=False,
         )
 
     from .onnx_fixup import fix_reshape_allowzero
