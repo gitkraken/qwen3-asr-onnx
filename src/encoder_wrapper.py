@@ -140,6 +140,7 @@ class EncoderWrapper(nn.Module):
             [1, valid_count, output_dim] audio features.
         """
         T = mel.shape[2]
+        conv_width = torch._shape_as_tensor(mel)[2].clamp(max=CONV_WINDOW)
 
         # --- Stage 1: Windowed Conv2D ---
         # Pad T to next multiple of CONV_WINDOW (no-op when already aligned)
@@ -155,9 +156,14 @@ class EncoderWrapper(nn.Module):
         x = x.permute(1, 0, 2)  # [N, 128, 100]
         x = x.unsqueeze(1)  # [N, 1, 128, 100]
 
-        # Conv2D stem
+        # Native single-chunk convolutions have width min(T, 100). Masking
+        # between layers preserves their zero-padding boundaries after batching.
         x = F.gelu(self.conv2d1(x))
+        conv_width = _conv_out_len(conv_width)
+        x = x * (torch.arange(x.shape[-1], device=x.device) < conv_width).to(x.dtype)
         x = F.gelu(self.conv2d2(x))
+        conv_width = _conv_out_len(conv_width)
+        x = x * (torch.arange(x.shape[-1], device=x.device) < conv_width).to(x.dtype)
         x = F.gelu(self.conv2d3(x))
 
         # [N, 480, 16, tokens_per_window] -> [N, tokens_per_window, 7680] -> [N, tpw, 896]
