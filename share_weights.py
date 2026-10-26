@@ -168,14 +168,12 @@ def copy_artifact_entry(source, output, name):
 def write_artifact_json(output, name, value):
     destination = Path(output) / name
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", prefix=".artifact-", dir=destination.parent, delete=False) as temporary:
-        staged = Path(temporary.name)
-        json.dump(value, temporary, indent=2)
-    try:
+    with tempfile.TemporaryDirectory(prefix=".artifact-", dir=destination.parent) as temp:
+        staged = Path(temp) / "value.json"
+        with staged.open("w") as stream:
+            json.dump(value, stream, indent=2)
         staged.chmod(0o644)
         os.replace(staged, destination)
-    finally:
-        staged.unlink(missing_ok=True)
 
 
 def _tensor_chunks(tensor, root):
@@ -300,6 +298,7 @@ def share_external_models(model_dir, suffix=None):
     ]
     already_shared = (
         (root / shared_name).is_file()
+        and bool(old_files)
         and old_files <= {root / shared_name}
         and all((tensor.data_location == onnx.TensorProto.EXTERNAL) == shareable for tensor, shareable in storage)
     )

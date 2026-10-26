@@ -362,3 +362,21 @@ def test_identical_canonical_symlink_rejected_before_graph_publication(tmp_path)
         share.share_external_models(tmp_path)
     assert {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()} == before
     _assert_pair(tmp_path, expected)
+
+
+def test_small_inline_pair_rejects_foreign_canonical_data(tmp_path):
+    weight = np.ones((2, 2), dtype=np.float32)
+    for name in share._decoder_filenames():
+        _write_model(tmp_path, name, weight=weight)
+    canonical = tmp_path / "decoder_weights.data"
+    canonical.write_bytes(b"foreign retained bytes")
+    before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+    with pytest.raises(ValueError, match="incompatible"):
+        share.share_external_models(tmp_path)
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
+
+
+def test_atomic_json_writer_removes_staging_after_serialization_failure(tmp_path):
+    with pytest.raises(TypeError):
+        share.write_artifact_json(tmp_path, "config.json", {"invalid": object()})
+    assert list(tmp_path.iterdir()) == []
