@@ -234,10 +234,11 @@ def _file_digest(path):
         return hashlib.file_digest(stream, "sha256").digest()
 
 
-def _live_data_files(root):
+def _live_data_files(root, excluded):
     live = set()
     for path in root.rglob("*.onnx"):
-        live.update(external_data_files(path))
+        if path not in excluded:
+            live.update(external_data_files(path))
     return live
 
 
@@ -256,9 +257,8 @@ def _publish_data(staged, target):
     os.replace(staged, target)
 
 
-def _cleanup_data(root, names):
+def _cleanup_data(root, names, live):
     candidates = {root / f"{name}.data" for name in names}
-    live = _live_data_files(root)
     for path in candidates - live:
         if path.exists():
             path.unlink()
@@ -291,6 +291,7 @@ def share_external_models(model_dir, suffix=None):
     old_files = set().union(*(external_data_files(root / name) for name in names))
     shared_name = _shared_data_name(suffix)
     _validate_models(root, names)
+    live = _live_data_files(root, {root / name for name in names})
     storage = [
         (tensor, _can_share(tensor, root, initializer))
         for model in models
@@ -304,7 +305,7 @@ def share_external_models(model_dir, suffix=None):
     )
     if already_shared:
         _validate_runtime_models(root, names)
-        _cleanup_data(root, names)
+        _cleanup_data(root, names, live)
         return True
     with tempfile.TemporaryDirectory(prefix=".share-", dir=root) as tmp:
         stage = Path(tmp)
@@ -320,7 +321,7 @@ def share_external_models(model_dir, suffix=None):
         for name in names:
             os.replace(stage / name, root / name)
         _validate_models(root, names)
-    _cleanup_data(root, names)
+    _cleanup_data(root, names, live)
     return True
 
 

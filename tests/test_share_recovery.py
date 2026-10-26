@@ -7,6 +7,7 @@ import onnx
 import onnxruntime as ort
 import pytest
 import torch
+from google.protobuf.message import DecodeError
 from onnx import TensorProto, helper, numpy_helper
 
 import share_weights as share
@@ -380,3 +381,25 @@ def test_atomic_json_writer_removes_staging_after_serialization_failure(tmp_path
     with pytest.raises(TypeError):
         share.write_artifact_json(tmp_path, "config.json", {"invalid": object()})
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("auxiliary", ["aux.onnx", "nested/aux.onnx"])
+@pytest.mark.parametrize("already_shared", [False, True])
+def test_unrelated_invalid_graph_rejected_before_decoder_publication(tmp_path, auxiliary, already_shared):
+    expected = _pair(tmp_path)
+    if already_shared:
+        assert share.share_external_models(tmp_path)
+    graph = tmp_path / auxiliary
+    graph.parent.mkdir(parents=True, exist_ok=True)
+    graph.write_bytes(b"invalid unrelated graph")
+    before = {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    for _ in range(2):
+        with pytest.raises(DecodeError, match="parsing"):
+            share.share_external_models(tmp_path)
+        assert {
+            path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()
+        } == before
+    graph.unlink()
+    assert share.share_external_models(tmp_path)
+    _assert_pair(tmp_path, expected)
+    assert not list(tmp_path.glob("*.onnx.data"))
