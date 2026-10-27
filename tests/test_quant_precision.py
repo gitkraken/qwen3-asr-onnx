@@ -583,13 +583,229 @@ def test_precision_guard_checks_local_function_operators(function_bits):
         [operator(function_bits)],
         [helper.make_opsetid("com.microsoft", 1)],
     )
-    graph = helper.make_graph([operator(4)], "root", [], [])
+    graph = helper.make_graph(
+        [operator(4), helper.make_node("Quantized", ["x", "w", "scales"], ["z"], domain="local")], "root", [], []
+    )
     model = helper.make_model(graph, functions=[function])
     if function_bits == 4:
         verify_quantized_precision(model, 4, 32)
     else:
         with pytest.raises(ValueError, match="bits=8"):
             verify_quantized_precision(model, 4, 32)
+
+
+def test_unused_function_cannot_authorize_quantized_output(tmp_path):
+    from quantize_nbits import quantize_decoder
+
+    function = helper.make_function(
+        "local",
+        "Unused",
+        ["x", "w", "scales"],
+        ["y"],
+        [helper.make_node("MatMulNBits", ["x", "w", "scales"], ["y"], domain="com.microsoft", bits=4, block_size=32)],
+        [helper.make_opsetid("com.microsoft", 1)],
+    )
+    graph = helper.make_graph(
+        [helper.make_node("MatMul", ["x", "w"], ["y"])],
+        "dynamic",
+        [
+            helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 32]),
+            helper.make_tensor_value_info("w", TensorProto.FLOAT, [32, 32]),
+        ],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 32])],
+    )
+    path, output = tmp_path / "dynamic.onnx", tmp_path / "dynamic.int4.onnx"
+    onnx.save(
+        helper.make_model(graph, functions=[function], opset_imports=[helper.make_opsetid("", 18)], ir_version=10), path
+    )
+    output.write_bytes(b"prior output")
+    with pytest.raises(ValueError, match="No MatMulNBits"):
+        quantize_decoder(str(path), str(output), 4, 32, None, "rtn", None)
+    assert output.read_bytes() == b"prior output"
+
+
+@pytest.mark.parametrize("placement", ["transitive", "nested"])
+@pytest.mark.parametrize("bits", [4, 8])
+def test_precision_follows_called_functions_and_nested_graphs(placement, bits):
+    from quantize_nbits import verify_quantized_precision
+
+    operator = helper.make_node(
+        "MatMulNBits", ["x", "w", "scales"], ["y"], domain="com.microsoft", bits=bits, block_size=32
+    )
+    leaf = helper.make_function(
+        "local", "Leaf", ["x", "w", "scales"], ["y"], [operator], [helper.make_opsetid("com.microsoft", 1)]
+    )
+    call = helper.make_node("Leaf", ["x", "w", "scales"], ["y"], domain="local")
+    if placement == "transitive":
+        parent = helper.make_function(
+            "local", "Parent", ["x", "w", "scales"], ["y"], [call], [helper.make_opsetid("local", 1)]
+        )
+        nodes = [helper.make_node("Parent", ["x", "w", "scales"], ["y"], domain="local")]
+        functions = [parent, leaf]
+    else:
+        branch = helper.make_graph([call], "branch", [], [])
+        nodes = [helper.make_node("If", ["condition"], ["y"], then_branch=branch, else_branch=branch)]
+        functions = [leaf]
+    model = helper.make_model(helper.make_graph(nodes, "root", [], []), functions=functions)
+    if bits == 4:
+        verify_quantized_precision(model, 4, 32)
+    else:
+        with pytest.raises(ValueError, match="bits=8"):
+            verify_quantized_precision(model, 4, 32)
+
+
+def test_precision_rejects_called_function_attribute_indirection():
+    from quantize_nbits import verify_quantized_precision
+
+    operator = helper.make_node("MatMulNBits", ["x", "w", "scales"], ["y"], domain="com.microsoft", block_size=32)
+    operator.attribute.append(
+        helper.make_attribute_ref("bits", onnx.AttributeProto.INT, ref_attr_name="requested_bits")
+    )
+    function = helper.make_function(
+        "local",
+        "Indirect",
+        ["x", "w", "scales"],
+        ["y"],
+        [operator],
+        [helper.make_opsetid("com.microsoft", 1)],
+        attributes=["requested_bits"],
+    )
+    call = helper.make_node("Indirect", ["x", "w", "scales"], ["y"], domain="local", requested_bits=4)
+    model = helper.make_model(helper.make_graph([call], "root", [], []), functions=[function])
+    with pytest.raises(ValueError, match="reference attribute"):
+        verify_quantized_precision(model, 4, 32)
+
+
+def _function_graph_argument_model(active_bits=None, argument_bits=4):
+    def operator(bits):
+        return helper.make_node(
+            "MatMulNBits", ["x", "w", "s"], ["y"], domain="com.microsoft", bits=bits, block_size=32, K=32, N=32
+        )
+
+    body = [operator(active_bits)] if active_bits is not None else [helper.make_node("Identity", ["x"], ["y"])]
+    function = helper.make_function(
+        "local",
+        "Projection",
+        ["x", "w", "s"],
+        ["y"],
+        body,
+        [helper.make_opsetid("", 18), helper.make_opsetid("com.microsoft", 1)],
+        attributes=["unused"],
+    )
+    argument = helper.make_graph(
+        [operator(argument_bits)], "argument", [], [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 32])]
+    )
+    graph = helper.make_graph(
+        [helper.make_node("Projection", ["x", "w", "s"], ["y"], domain="local", name="projection", unused=argument)],
+        "root",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 32])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 32])],
+        [
+            numpy_helper.from_array(np.zeros((32, 1, 16), np.uint8), "w"),
+            numpy_helper.from_array(np.ones((32, 1), np.float32), "s"),
+        ],
+    )
+    return helper.make_model(
+        graph,
+        functions=[function],
+        opset_imports=[
+            helper.make_opsetid("", 18),
+            helper.make_opsetid("local", 1),
+            helper.make_opsetid("com.microsoft", 1),
+        ],
+        ir_version=10,
+    )
+
+
+def test_unused_local_function_graph_argument_cannot_authorize_output(tmp_path):
+    from quantize_nbits import quantize_decoder
+
+    path, output = tmp_path / "plain.onnx", tmp_path / "plain.int4.onnx"
+    model = _function_graph_argument_model()
+    onnx.save(model, path)
+    onnx.checker.check_model(str(path))
+    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    inputs = np.arange(32, dtype=np.float32).reshape(1, 32)
+    np.testing.assert_array_equal(session.run(None, {"x": inputs})[0], inputs)
+    output.write_bytes(b"prior output")
+    with pytest.raises(ValueError, match="No MatMulNBits"):
+        quantize_decoder(str(path), str(output), 4, 32, None, "rtn", None)
+    assert output.read_bytes() == b"prior output"
+
+
+def test_unused_graph_argument_does_not_override_called_precision(tmp_path):
+    from quantize_nbits import quantize_decoder
+
+    path, output = tmp_path / "called.onnx", tmp_path / "called.int4.onnx"
+    onnx.save(_function_graph_argument_model(active_bits=4, argument_bits=8), path)
+    onnx.checker.check_model(str(path))
+    quantize_decoder(str(path), str(output), 4, 32, None, "rtn", None)
+    onnx.checker.check_model(str(output))
+    session = ort.InferenceSession(str(output), providers=["CPUExecutionProvider"])
+    assert np.isfinite(session.run(None, {"x": np.ones((1, 32), np.float32)})[0]).all()
+
+
+def test_quantization_preserves_portable_rms_scalar_attributes(tmp_path):
+    from optimize_graphs import RMS_DOMAIN, _rms_function
+    from quantize_nbits import quantize_decoder
+
+    model = _function_graph_argument_model(active_bits=4)
+    model.graph.node[0].output[0] = "projected"
+    model.graph.node.append(
+        helper.make_node("RMSNormalization", ["projected", "gain"], ["y"], domain=RMS_DOMAIN, name="rms", epsilon=1e-6)
+    )
+    model.graph.initializer.append(numpy_helper.from_array(np.ones(32, np.float32), "gain"))
+    model.functions.append(_rms_function(18))
+    model.opset_import.append(helper.make_opsetid(RMS_DOMAIN, 1))
+    path, output = tmp_path / "rms.onnx", tmp_path / "rms.int4.onnx"
+    onnx.save(model, path)
+    onnx.checker.check_model(str(path))
+    original = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    inputs = {"x": np.ones((1, 32), np.float32)}
+    expected = original.run(None, inputs)[0]
+    quantize_decoder(str(path), str(output), 4, 32, None, "rtn", None)
+    onnx.checker.check_model(str(output))
+    session = ort.InferenceSession(str(output), providers=["CPUExecutionProvider"])
+    np.testing.assert_array_equal(session.run(None, inputs)[0], expected)
+
+
+def test_precision_rejects_unresolved_executable_graph_attribute():
+    from quantize_nbits import verify_quantized_precision
+
+    branch = helper.make_graph([helper.make_node("Identity", ["x"], ["y"])], "branch", [], [])
+    conditional = helper.make_node("If", ["condition"], ["y"], else_branch=branch)
+    conditional.attribute.append(
+        helper.make_attribute_ref("then_branch", onnx.AttributeProto.GRAPH, ref_attr_name="body")
+    )
+    function = helper.make_function(
+        "local", "Branch", ["x", "condition"], ["y"], [conditional], [helper.make_opsetid("", 18)], attributes=["body"]
+    )
+    call = helper.make_node("Branch", ["x", "condition"], ["y"], domain="local", body=branch)
+    model = helper.make_model(helper.make_graph([call], "root", [], []), functions=[function])
+    with pytest.raises(ValueError, match="indirection is unsupported"):
+        verify_quantized_precision(model, 4, 32)
+
+
+def test_precision_uses_called_function_overload():
+    from quantize_nbits import verify_quantized_precision
+
+    functions = []
+    for bits in (4, 8):
+        operator = helper.make_node(
+            "MatMulNBits", ["x", "w", "s"], ["y"], domain="com.microsoft", bits=bits, block_size=32
+        )
+        function = helper.make_function(
+            "local", "Projection", ["x", "w", "s"], ["y"], [operator], [helper.make_opsetid("com.microsoft", 1)]
+        )
+        function.overload = str(bits)
+        functions.append(function)
+    call = helper.make_node("Projection", ["x", "w", "s"], ["y"], domain="local")
+    call.overload = "4"
+    model = helper.make_model(helper.make_graph([call], "root", [], []), functions=functions)
+    verify_quantized_precision(model, 4, 32)
+    model.graph.node[0].overload = "8"
+    with pytest.raises(ValueError, match="bits=8"):
+        verify_quantized_precision(model, 4, 32)
 
 
 def test_gptq_completed_output_survives_input_staging_cleanup_error(tmp_path, monkeypatch, capsys):

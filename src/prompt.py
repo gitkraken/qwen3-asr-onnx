@@ -45,16 +45,7 @@ def validate_prompt_tokenizer(tokenizer) -> None:
         if not ids or tokenizer.unk_token_id in ids:
             raise ValueError(f"Tokenizer cannot encode the {role} role")
     for context, language in (("", None), ("Kepler", None), ("", "English"), ("Kepler", "English")):
-        actual = build_prompt_ids(2, tokenizer, context=context, language=language)
-        expected_text = (
-            f"<|im_start|>system\n{context}<|im_end|>\n"
-            "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_pad|><|audio_end|><|im_end|>\n"
-            "<|im_start|>assistant\n"
-        )
-        if language is not None:
-            expected_text += f"language {language}<asr_text>"
-        if actual != tokenizer.encode(expected_text, add_special_tokens=False):
-            raise ValueError("Tokenizer chat template does not implement the Qwen3-ASR prompt contract")
+        build_prompt_ids(2, tokenizer, context=context, language=language)
 
 
 def get_feat_extract_output_lengths(input_lengths: int) -> int:
@@ -75,6 +66,13 @@ def build_prompt_ids(audio_token_count: int, tokenizer, language: str | None = N
         {"role": "user", "content": [{"type": "audio", "audio": ""}]},
     ]
     text = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    expected_text = (
+        f"<|im_start|>system\n{context}<|im_end|>\n"
+        "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+    if text != expected_text:
+        raise ValueError("Tokenizer chat template does not implement the Qwen3-ASR prompt contract")
     if language is not None:
         text += f"language {language}<asr_text>"
     ids = tokenizer.encode(text, add_special_tokens=False)

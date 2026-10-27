@@ -191,7 +191,7 @@ INT8 AWQ is not published to HuggingFace but can be built locally for a smaller-
 # Collect calibration activations, smooth weights, re-export FP32 ONNX
 python awq_smooth.py --model Qwen/Qwen3-ASR-0.6B \
     --output output/qwen3-asr-0.6b-smooth \
-    --alpha 0.2 --n-samples 128 --verify
+    --alpha 0.2 --n-samples 128 --device cpu --verify
 
 # Quantize the smoothed model to INT8 (adds .int8 files alongside FP32)
 python quantize.py \
@@ -199,13 +199,12 @@ python quantize.py \
     --output output/qwen3-asr-0.6b
 ```
 
-α=0.2 is the optimal smoothing strength for 0.6B INT8. Calibration activations are cached in the smooth output directory (`calibration_activations.npz`). To sweep alpha values without re-collecting:
+α=0.2 is the optimal smoothing strength for 0.6B INT8. Calibration activations are cached in the smooth output directory as `calibration_activations_<identity>.npz`. To sweep alpha values without re-collecting, keep the same model, output directory, sample count and device; only change alpha. The default cache key excludes alpha and verifies the checkpoint, tokenizer and collection recipe:
 
 ```bash
 python awq_smooth.py --model Qwen/Qwen3-ASR-0.6B \
     --output output/qwen3-asr-0.6b-smooth \
-    --alpha 0.2 \
-    --activations-cache output/qwen3-asr-0.6b-smooth/calibration_activations.npz
+    --n-samples 128 --device cpu --alpha 0.4
 ```
 
 ### Evaluate WER

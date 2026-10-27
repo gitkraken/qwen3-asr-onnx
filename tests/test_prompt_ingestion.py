@@ -30,8 +30,8 @@ def test_loader_rejects_incorrect_roles_with_valid_audio(tmp_path, representatio
     tokenizer = save_tokenizer_assets(tmp_path, representation)
     bad_template = OFFICIAL_CHAT_TEMPLATE.replace(role + "\\n", replacement + "\\n")
     tokenizer.chat_template = bad_template
-    ids = prompt.build_prompt_ids(1, tokenizer)
-    prompt.get_audio_pad_range(ids, expected_count=1)
+    with pytest.raises(ValueError, match="prompt contract"):
+        prompt.build_prompt_ids(1, tokenizer)
     _change_template(tmp_path, representation, bad_template)
     with pytest.raises(ValueError, match="prompt contract"):
         prompt.load_prompt_tokenizer(str(tmp_path), local_files_only=True)

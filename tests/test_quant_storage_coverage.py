@@ -126,3 +126,26 @@ def test_supported_function_tensor_storage_is_preserved(tmp_path):
         assert len(dependencies) == 1
         assert next(iter(dependencies)).read_bytes() == (inputs / "extra.data").read_bytes()
     assert _snapshot(inputs) == original
+
+
+@pytest.mark.parametrize("reader", ["shared", "rtn", "gptq"])
+def test_graph_file_alias_preserves_lexical_external_data_base(tmp_path, reader):
+    physical, lexical = tmp_path / "physical", tmp_path / "lexical"
+    physical.mkdir()
+    lexical.mkdir()
+    _write_model(
+        physical, "model.onnx", external=True, data_name="weights.data", weight=np.full((4, 3), 99, np.float32)
+    )
+    (lexical / "model.onnx").symlink_to(physical / "model.onnx")
+    (lexical / "weights.data").write_bytes(np.full((4, 3), 42, np.float32).tobytes())
+    path = lexical / "model.onnx"
+    expected = onnx.load(path).graph.initializer[0]
+    assert external_data_files(path) == {lexical / "weights.data"}
+    context = isolated_onnx_input(path) if reader == "shared" else _quantization_input(str(path), reader)
+    before = _snapshot(tmp_path)
+    with context as (model, _):
+        actual = model if isinstance(model, onnx.ModelProto) else onnx.load(model)
+        np.testing.assert_array_equal(
+            numpy_helper.to_array(actual.graph.initializer[0]), numpy_helper.to_array(expected)
+        )
+    assert _snapshot(tmp_path) == before

@@ -109,6 +109,27 @@ def test_ort_inference_never_writes_in_source_namespace(tmp_path, kind, storage_
     np.testing.assert_allclose(_ort_result(output), expected, atol=1e-4, rtol=1e-4)
 
 
+@pytest.mark.parametrize("kind", ["dynamic", "static"])
+def test_ort_quantizers_use_graph_alias_directory_for_weights(tmp_path, kind):
+    physical, source = tmp_path / "physical", tmp_path / "source"
+    physical.mkdir()
+    source.mkdir()
+    _write_model(
+        physical, "model.onnx", external=True, data_name="weights.data", weight=np.full((4, 3), 99, np.float32)
+    )
+    (source / "model.onnx").symlink_to(physical / "model.onnx")
+    (source / "weights.data").write_bytes(np.full((4, 3), 42, np.float32).tobytes())
+    expected = _ort_result(source / "model.onnx")
+    before = bytes_under(source), bytes_under(physical)
+    output = tmp_path / "quantized.onnx"
+    if kind == "dynamic":
+        dynamic.quantize_onnx_file(str(source / "model.onnx"), str(output))
+    else:
+        static.quantize_decoder(str(source / "model.onnx"), str(output), [{"x": np.ones((1, 4), dtype=np.float32)}])
+    np.testing.assert_allclose(_ort_result(output), expected, atol=1e-4, rtol=1e-4)
+    assert (bytes_under(source), bytes_under(physical)) == before
+
+
 def test_dynamic_retry_keeps_both_attempts_in_owned_input_stage(tmp_path, monkeypatch):
     source = input_for(tmp_path, "quantize.py")
     _write_model(

@@ -69,7 +69,7 @@ def external_tensor_range(root, tensor):
 
 
 def external_data_files(model_path):
-    path = Path(model_path).resolve()
+    path = Path(model_path).absolute()
     model = onnx.load(path, load_external_data=False)
     if not model.HasField("graph") or not model.ir_version:
         raise ValueError(f"Not an ONNX graph: {path}")
@@ -277,7 +277,7 @@ def validate_quantization_storage(model):
 
 @contextmanager
 def isolated_onnx_input(input_path, *, prefix="qwen-onnx-"):
-    source = Path(input_path).resolve()
+    source = Path(input_path).absolute()
     model = onnx.load(source, load_external_data=False)
     validate_quantization_storage(model)
     dependencies = sorted(external_data_files(source))

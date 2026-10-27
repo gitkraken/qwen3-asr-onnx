@@ -85,7 +85,26 @@ def recipe(kind, inputs, parameters, producer):
 
 
 def tokenizer_fingerprint(tokenizer):
-    value = {"vocab": tokenizer.get_vocab(), "template": tokenizer.get_chat_template()}
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is None:
+        raise ValueError("Calibration cache identity requires a serializable fast tokenizer backend")
+    value = {
+        "class": [type(tokenizer).__module__, type(tokenizer).__qualname__],
+        "backend": json.loads(backend.to_str()),
+        "template": tokenizer.get_chat_template(),
+        "special_tokens": tokenizer.special_tokens_map,
+        "settings": {
+            name: getattr(tokenizer, name, None)
+            for name in (
+                "padding_side",
+                "truncation_side",
+                "model_max_length",
+                "split_special_tokens",
+                "add_bos_token",
+                "add_eos_token",
+            )
+        },
+    }
     return hashlib.sha256(_json(value).encode()).hexdigest()
 
 
@@ -95,9 +114,11 @@ def cache_key(identity):
 
 def load_cache(path, identity):
     path = Path(path)
-    if not path.exists():
-        return None
     try:
+        if not path.exists() and not path.is_symlink():
+            return None
+        if not path.is_file():
+            raise ValueError("Calibration cache is not a regular file")
         with np.load(path, allow_pickle=False) as archive:
             stored = archive["__recipe__"]
             if stored.shape != () or stored.dtype.kind != "U" or json.loads(stored.item()) != identity:

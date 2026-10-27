@@ -4,14 +4,27 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 import awq_smooth
 import quantize_static
+from src.calibration_cache import model_fingerprint, recipe, save_cache, tokenizer_fingerprint
 from src.onnx_export import export_onnx
 from tests.test_artifact_contract import _ort_result, _write_external_identity
 from tests.test_tokenizer_transport import _source
 from tests.tokenizer_fixtures import save_tokenizer_assets
+
+
+def _awq_model():
+    model = torch.nn.Module()
+    model.thinker = torch.nn.Module()
+    model.thinker.model = torch.nn.Module()
+    model.thinker.model.embed_tokens = torch.nn.Embedding(8, 4)
+    model.thinker.model.norm = torch.nn.LayerNorm(4)
+    model.thinker.model.layers = torch.nn.ModuleList()
+    model.config = SimpleNamespace(to_dict=lambda: {})
+    return model
 
 
 def test_static_legacy_cache_is_preserved_and_only_matching_cache_is_reused(tmp_path, monkeypatch):
@@ -73,11 +86,7 @@ def test_awq_legacy_cache_is_preserved_and_checkpoint_identity_controls_reuse(tm
     data = output / "encoder.onnx.data"
     np.array([42], dtype=np.float32).tofile(data)
     _write_external_identity(output, "aux.onnx", data.name)
-    model = torch.nn.Module()
-    model.thinker = torch.nn.Module()
-    model.thinker.model = torch.nn.Module()
-    model.thinker.model.embed_tokens = torch.nn.Embedding(8, 4)
-    model.config = SimpleNamespace(to_dict=lambda: {})
+    model = _awq_model()
     monkeypatch.setattr(awq_smooth, "load_model", lambda *args, **kwargs: copy.deepcopy(model))
     collected = []
     scales = []
@@ -118,3 +127,80 @@ def test_awq_legacy_cache_is_preserved_and_checkpoint_identity_controls_reuse(tm
     assert legacy.read_bytes() == legacy_bytes
     assert data.read_bytes() == np.array([42], dtype=np.float32).tobytes()
     np.testing.assert_array_equal(_ort_result(output / "aux.onnx"), [42])
+
+
+@pytest.mark.parametrize("origin", ["cached", "collected"])
+@pytest.mark.parametrize("problem", ["keys", "shape", "negative", "integer"])
+def test_awq_rejects_malformed_activations_before_publication(tmp_path, monkeypatch, origin, problem):
+    source, output = tmp_path / "checkpoint", tmp_path / "output"
+    tokenizer = save_tokenizer_assets(source)
+    output.mkdir()
+    scales = output / "smoothing_scales.npz"
+    scales.write_bytes(b"prior scales")
+    model = _awq_model()
+    activations = {"norm": torch.ones(4)}
+    if problem == "keys":
+        activations = {"unknown": torch.ones(4)}
+    elif problem == "shape":
+        activations = {"norm": torch.ones(1)}
+    elif problem == "negative":
+        activations = {"norm": -torch.ones(4)}
+    elif problem == "integer":
+        activations = {"norm": torch.ones(4, dtype=torch.int64)}
+    identity = recipe(
+        "awq",
+        {"checkpoint": model_fingerprint(model), "tokenizer": tokenizer_fingerprint(tokenizer)},
+        {"n_samples": 1, "device": "cpu"},
+        Path(awq_smooth.__file__),
+    )
+    cache = output / "explicit.npz"
+    if origin == "cached":
+        save_cache(cache, identity, {k: v.numpy() for k, v in activations.items()})
+    before = cache.read_bytes() if cache.exists() else None
+    monkeypatch.setattr(awq_smooth, "load_model", lambda *args, **kwargs: copy.deepcopy(model))
+    monkeypatch.setattr(awq_smooth, "collect_activations", lambda *args, **kwargs: activations)
+    monkeypatch.setattr(
+        awq_smooth, "apply_smoothing", lambda *args: pytest.fail("Invalid activations reached smoothing")
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "awq_smooth.py",
+            "--model",
+            str(source),
+            "--output",
+            str(output),
+            "--n-samples",
+            "1",
+            "--activations-cache",
+            str(cache),
+        ],
+    )
+    with pytest.raises(ValueError, match="activation|Unverifiable"):
+        awq_smooth.main()
+    assert scales.read_bytes() == b"prior scales"
+    assert (cache.read_bytes() if cache.exists() else None) == before
+
+
+def test_awq_preserves_explicit_dangling_cache_before_collection(tmp_path, monkeypatch):
+    source, output = tmp_path / "checkpoint", tmp_path / "output"
+    save_tokenizer_assets(source)
+    output.mkdir()
+    cache = output / "explicit.npz"
+    cache.symlink_to(tmp_path / "unknown.npz")
+    scales = output / "smoothing_scales.npz"
+    scales.write_bytes(b"prior scales")
+    monkeypatch.setattr(awq_smooth, "load_model", lambda *args, **kwargs: _awq_model())
+    monkeypatch.setattr(
+        awq_smooth, "collect_activations", lambda *args, **kwargs: pytest.fail("Unknown cache reached collection")
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["awq_smooth.py", "--model", str(source), "--output", str(output), "--activations-cache", str(cache)],
+    )
+    with pytest.raises(ValueError, match="Unverifiable"):
+        awq_smooth.main()
+    assert cache.is_symlink() and cache.readlink() == tmp_path / "unknown.npz"
+    assert scales.read_bytes() == b"prior scales"

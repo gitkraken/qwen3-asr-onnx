@@ -61,6 +61,33 @@ from validate import greedy_decode_pytorch, run_encoder_pytorch
 # ---------------------------------------------------------------------------
 
 
+def activation_norms(model):
+    text_model = model.thinker.model
+    modules = {}
+    for i, layer in enumerate(text_model.layers):
+        modules[f"layers.{i}.input_layernorm"] = layer.input_layernorm
+        modules[f"layers.{i}.post_attention_layernorm"] = layer.post_attention_layernorm
+    modules["norm"] = text_model.norm
+    return modules
+
+
+def validate_activations(model, activations):
+    norms = activation_norms(model)
+    if activations.keys() != norms.keys():
+        raise ValueError("AWQ activation keys must match the model's norm modules")
+    for name, value in activations.items():
+        if (
+            not torch.is_tensor(value)
+            or not value.is_floating_point()
+            or value.shape != norms[name].weight.shape
+            or not torch.isfinite(value).all()
+            or (value < 0).any()
+        ):
+            raise ValueError(
+                f"Invalid AWQ activation vector for {name}; expected finite nonnegative per-channel values"
+            )
+
+
 def collect_activations(
     model,
     n_samples: int,
@@ -77,16 +104,7 @@ def collect_activations(
     Returns dict mapping norm name -> Tensor[hidden_size] of mean absolute
     per-channel activations.
     """
-    text_model = model.thinker.model
-    num_layers = len(text_model.layers)
-
-    # Identify target norm modules and their names
-    norm_modules: dict[str, torch.nn.Module] = {}
-    for i in range(num_layers):
-        layer = text_model.layers[i]
-        norm_modules[f"layers.{i}.input_layernorm"] = layer.input_layernorm
-        norm_modules[f"layers.{i}.post_attention_layernorm"] = layer.post_attention_layernorm
-    norm_modules["norm"] = text_model.norm
+    norm_modules = activation_norms(model)
 
     # Accumulators: sum of per-channel mean-abs activations, and count
     accum: dict[str, torch.Tensor] = {}
@@ -441,8 +459,10 @@ def main():
         t0 = time.time()
         activations = collect_activations(model, n_samples=args.n_samples, tokenizer=tokenizer, device=args.device)
         print(f"Collection done in {time.time() - t0:.1f}s")
-        save_cache(acts_cache, identity, {name: value.cpu().numpy() for name, value in activations.items()})
 
+    validate_activations(model, activations)
+    if cached is None:
+        save_cache(acts_cache, identity, {name: value.cpu().numpy() for name, value in activations.items()})
     # Compute smoothing scales
     print(f"\nComputing scales (alpha={args.alpha})...")
     scales = compute_scales(activations, alpha=args.alpha)

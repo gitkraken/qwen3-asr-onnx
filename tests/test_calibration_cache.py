@@ -13,6 +13,7 @@ from src.calibration_cache import (
     pack_samples,
     recipe,
     save_cache,
+    tokenizer_fingerprint,
     unpack_samples,
 )
 from tests.test_artifact_contract import _release_input, _write_model
@@ -119,3 +120,27 @@ def test_checkpoint_configuration_and_execution_mode_affect_identity():
 def test_invalid_sample_count_rejected_before_iteration(count):
     with pytest.raises(ValueError, match="sample count"):
         unpack_samples({"init_count": np.array(count, dtype=np.int64)}, ("init",))
+
+
+def test_tokenizer_backend_affects_cache_identity(tmp_path):
+    from tokenizers import normalizers
+
+    from src.prompt import build_prompt_ids, validate_prompt_tokenizer
+    from tests.tokenizer_fixtures import save_tokenizer_assets
+
+    tokenizer = save_tokenizer_assets(tmp_path)
+    before = tokenizer_fingerprint(tokenizer)
+    original_ids = build_prompt_ids(2, tokenizer)
+    tokenizer.backend_tokenizer.normalizer = normalizers.Replace("system", "assistant")
+    validate_prompt_tokenizer(tokenizer)
+    assert build_prompt_ids(2, tokenizer) != original_ids
+    assert tokenizer_fingerprint(tokenizer) != before
+
+
+def test_dangling_cache_entry_is_preserved(tmp_path):
+    path = tmp_path / "cache.npz"
+    path.symlink_to(tmp_path / "missing.npz")
+    with pytest.raises(ValueError, match="Unverifiable"):
+        load_cache(path, _identity(tmp_path))
+    assert path.is_symlink()
+    assert not path.exists()

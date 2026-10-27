@@ -90,6 +90,26 @@ def test_rejects_control_tokens_in_context(tokenizer):
         prompt.build_prompt_ids(2, tokenizer, context="<|audio_pad|>")
 
 
+@pytest.mark.parametrize("change", ["context", "role"])
+def test_actual_context_is_checked_after_loader_probes(tokenizer, change):
+    template = OFFICIAL_CHAT_TEMPLATE.replace(
+        "(ns.system_text if ns.system_text is string else '')",
+        "('' if ns.system_text == 'English' else ns.system_text)",
+    )
+    if change == "role":
+        template = (
+            "{% if messages[0].content == 'English' %}"
+            + OFFICIAL_CHAT_TEMPLATE.replace("system\\n", "assistant\\n")
+            + "{% else %}"
+            + OFFICIAL_CHAT_TEMPLATE
+            + "{% endif %}"
+        )
+    tokenizer.chat_template = template
+    prompt.validate_prompt_tokenizer(tokenizer)
+    with pytest.raises(ValueError, match="prompt contract"):
+        prompt.build_prompt_ids(3, tokenizer, context="English", language="English")
+
+
 def test_export_verifies_template_role_names(tokenizer, monkeypatch):
     import export
 

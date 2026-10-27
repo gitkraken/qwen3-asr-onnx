@@ -63,6 +63,23 @@ def test_interruption_after_data_publication_is_recoverable(tmp_path, monkeypatc
     _assert_shared(tmp_path)
 
 
+def test_sharing_uses_graph_alias_directory_for_weights(tmp_path):
+    physical, source = tmp_path / "physical", tmp_path / "source"
+    physical.mkdir()
+    source.mkdir()
+    expected = {}
+    for name in ("decoder_init.onnx", "decoder_step.onnx"):
+        data_name = name + ".data"
+        _write_model(physical, name, external=True, data_name=data_name, weight=np.full((32, 32), 99, np.float32))
+        (source / name).symlink_to(physical / name)
+        (source / data_name).write_bytes(np.full((32, 32), 42, np.float32).tobytes())
+        expected[name] = _ort_result(source / name)
+    before = {p.name: p.read_bytes() for p in physical.iterdir()}
+    assert share.share_external_models(source)
+    _assert_pair(source, expected)
+    assert {p.name: p.read_bytes() for p in physical.iterdir()} == before
+
+
 @pytest.mark.parametrize("inline", [False, True])
 @pytest.mark.parametrize("graph_name", ["decoder_init.onnx", "decoder_step.onnx"])
 def test_partial_proto_write_keeps_original_pair_usable(tmp_path, monkeypatch, inline, graph_name):

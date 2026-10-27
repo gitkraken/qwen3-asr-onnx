@@ -106,20 +106,29 @@ def validate_quantization_request(bits, block_size, algo, calib_data_path, nodes
             raise ValueError("GPTQ node exclusions are unsupported by the supported ORT algorithm; use RTN")
 
 
-def _quantized_nodes(graph):
+def _quantized_nodes(graph, functions, visited):
     for node in graph.node:
+        key = (node.domain, node.op_type, node.overload)
+        if key in functions:
+            if key not in visited:
+                visited.add(key)
+                yield from _quantized_nodes(functions[key], functions, visited)
+            continue
         if node.domain == "com.microsoft" and node.op_type == "MatMulNBits":
             yield node
         for attribute in node.attribute:
+            if attribute.ref_attr_name and attribute.type in (onnx.AttributeProto.GRAPH, onnx.AttributeProto.GRAPHS):
+                raise ValueError("Precision validation of function attribute indirection is unsupported")
             if attribute.type == onnx.AttributeProto.GRAPH:
-                yield from _quantized_nodes(attribute.g)
+                yield from _quantized_nodes(attribute.g, functions, visited)
             elif attribute.type == onnx.AttributeProto.GRAPHS:
                 for subgraph in attribute.graphs:
-                    yield from _quantized_nodes(subgraph)
+                    yield from _quantized_nodes(subgraph, functions, visited)
 
 
 def verify_quantized_precision(model, bits, block_size):
-    nodes = [node for graph in (model.graph, *model.functions) for node in _quantized_nodes(graph)]
+    functions = {(function.domain, function.name, function.overload): function for function in model.functions}
+    nodes = list(_quantized_nodes(model.graph, functions, set()))
     if not nodes:
         raise ValueError("No MatMulNBits operators were produced; refusing to label an unquantized model")
     for node in nodes:
@@ -138,7 +147,7 @@ def _quantization_input(input_path: str, algo: str) -> Iterator[tuple[onnx.Model
     if algo != "gptq":
         model = onnx.load(input_path, load_external_data=False)
         validate_quantization_storage(model)
-        onnx.external_data_helper.load_external_data_for_model(model, str(Path(input_path).resolve().parent))
+        onnx.external_data_helper.load_external_data_for_model(model, str(Path(input_path).absolute().parent))
         yield model, None
         return
     with isolated_onnx_input(input_path, prefix="qwen-gptq-") as (staged_model, stage):
