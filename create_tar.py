@@ -17,11 +17,8 @@ import tarfile
 from huggingface_hub import HfApi
 
 from src.artifact_publication import ArtifactStaging
-from src.onnx_artifacts import graph_file_closure
-from src.tokenizer_assets import tokenizer_asset_names, validate_tokenizer_assets
-
-# Shared metadata files included in every archive
-METADATA = ["embed_tokens.bin", "config.json"]
+from src.onnx_artifacts import preflight_artifact_mutations
+from src.release_validation import validate_release
 
 # Archives are built from release/ dirs (produced by package.py), which contain
 # the correct FP16 embed_tokens.bin and patched config.json.
@@ -34,7 +31,6 @@ ARCHIVES = [
             "encoder.onnx",
             "decoder_init.onnx",
             "decoder_step.onnx",
-            "decoder_weights.data",
         ],
     },
     {
@@ -45,11 +41,8 @@ ARCHIVES = [
             "encoder.int4.onnx",
             "decoder_init.int4.onnx",
             "decoder_step.int4.onnx",
-            "decoder_weights.int4.data",
         ],
     },
-    # NOTE: decoder_weights.int4.data is the shared external data file
-    # produced by share_weights.py — replaces per-file .onnx.data files
     {
         "name": "qwen3-asr-1.7b",
         "source_dir": "release/qwen3-asr-1.7b",
@@ -58,7 +51,6 @@ ARCHIVES = [
             "encoder.onnx",
             "decoder_init.onnx",
             "decoder_step.onnx",
-            "decoder_weights.data",
         ],
     },
     {
@@ -69,33 +61,21 @@ ARCHIVES = [
             "encoder.int4.onnx",
             "decoder_init.int4.onnx",
             "decoder_step.int4.onnx",
-            "decoder_weights.int4.data",
         ],
     },
 ]
 
 
 def create_tar(archive, output_dir):
-    """Create a tar.gz archive with the correct directory structure."""
     name = archive["name"]
     source_dir = archive["source_dir"]
-    try:
-        validate_tokenizer_assets(source_dir)
-    except Exception as error:
-        print(f"  ERROR: Invalid tokenizer assets: {error}")
-        return None
-    all_files = set(archive["files"]) | set(METADATA) | tokenizer_asset_names(source_dir)
-    if os.path.isfile(os.path.join(source_dir, "preprocessor_config.json")):
-        all_files.add("preprocessor_config.json")
+    graphs = {filename for filename in archive["files"] if filename.endswith(".onnx")}
     tar_path = os.path.join(output_dir, f"{name}.tar.gz")
-    for filename in sorted(all_files):
-        if not os.path.isfile(os.path.join(source_dir, filename)):
-            print(f"  ERROR: {os.path.join(source_dir, filename)} not found")
-            return None
     try:
-        all_files.update(graph_file_closure(source_dir, (file for file in archive["files"] if file.endswith(".onnx"))))
+        all_files = validate_release(source_dir, graphs)
+        preflight_artifact_mutations(source_dir, output_dir, (), generated={f"{name}.tar.gz"}, reads=graphs)
     except Exception as error:
-        print(f"  ERROR: Invalid graph dependencies: {error}")
+        print(f"  ERROR: Invalid release: {error}")
         return None
     print(f"  Creating {tar_path}...")
     try:

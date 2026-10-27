@@ -4,6 +4,7 @@ from pathlib import Path
 
 from src import prompt
 from src.artifact_publication import ArtifactStaging, publish_artifacts
+from src.prompt import validate_prompt_tokenizer
 
 TOKENIZER_FILES = frozenset(
     {
@@ -40,41 +41,11 @@ def validate_tokenizer_assets(root):
             raise ValueError(f"Required tokenizer asset missing: {name}")
     try:
         tokenizer = prompt.load_prompt_tokenizer(str(root), local_files_only=True)
-        _validate_prompt_tokenizer(tokenizer)
+        validate_prompt_tokenizer(tokenizer)
         _validate_shipped_templates(root, tokenizer)
     except Exception as error:
         raise ValueError(f"Invalid ASR tokenizer assets in {root}: {error}") from error
     return tokenizer
-
-
-def _validate_prompt_tokenizer(tokenizer) -> None:
-    special = {
-        "<|endoftext|>": prompt.ENDOFTEXT_TOKEN_ID,
-        "<|im_start|>": prompt.IM_START_TOKEN_ID,
-        "<|im_end|>": prompt.IM_END_TOKEN_ID,
-        "<|audio_start|>": prompt.AUDIO_START_TOKEN_ID,
-        "<|audio_end|>": prompt.AUDIO_END_TOKEN_ID,
-        "<|audio_pad|>": prompt.AUDIO_PAD_TOKEN_ID,
-        "<asr_text>": prompt.ASR_TEXT_TOKEN_ID,
-    }
-    for token, expected in special.items():
-        if tokenizer.convert_tokens_to_ids(token) != expected:
-            raise ValueError(f"Tokenizer has an invalid ASR special token: {token}")
-    for role in ("system", "user", "assistant"):
-        ids = tokenizer.encode(role, add_special_tokens=False)
-        if not ids or tokenizer.unk_token_id in ids:
-            raise ValueError(f"Tokenizer cannot encode the {role} role")
-    for context, language in (("", None), ("Kepler", None), ("", "English"), ("Kepler", "English")):
-        actual = prompt.build_prompt_ids(2, tokenizer, context=context, language=language)
-        expected_text = (
-            f"<|im_start|>system\n{context}<|im_end|>\n"
-            "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_pad|><|audio_end|><|im_end|>\n"
-            "<|im_start|>assistant\n"
-        )
-        if language is not None:
-            expected_text += f"language {language}<asr_text>"
-        if actual != tokenizer.encode(expected_text, add_special_tokens=False):
-            raise ValueError("Tokenizer chat template does not implement the Qwen3-ASR prompt contract")
 
 
 def _template_values(value):
@@ -112,7 +83,7 @@ def _validate_shipped_templates(root, tokenizer):
     try:
         for template in templates:
             tokenizer.chat_template = template
-            _validate_prompt_tokenizer(tokenizer)
+            validate_prompt_tokenizer(tokenizer)
     finally:
         tokenizer.chat_template = selected
 

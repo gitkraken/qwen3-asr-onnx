@@ -33,7 +33,6 @@ config, FP32 decoders) are copied to the output directory.
 import argparse
 import json
 import os
-import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -48,15 +47,15 @@ from onnxruntime.quantization.matmul_nbits_quantizer import (
 )
 from onnxruntime.quantization.quant_utils import QuantFormat
 
-from src.artifact_publication import ArtifactStaging
 from src.onnx_artifacts import (
     copy_artifact_entry,
-    external_data_files,
-    get_external_info,
+    external_tensor_range,
     inventory_graphs,
+    isolated_onnx_input,
     model_tensors,
     preflight_artifact_mutations,
     validate_generated_destinations,
+    validate_quantization_storage,
     write_artifact_json,
 )
 from src.tokenizer_assets import (
@@ -136,36 +135,23 @@ def verify_quantized_precision(model, bits, block_size):
 @contextmanager
 def _quantization_input(input_path: str, algo: str) -> Iterator[tuple[onnx.ModelProto | str, str | None]]:
     if algo != "gptq":
-        yield onnx.load(input_path), None
+        model = onnx.load(input_path, load_external_data=False)
+        validate_quantization_storage(model)
+        onnx.external_data_helper.load_external_data_for_model(model, str(Path(input_path).resolve().parent))
+        yield model, None
         return
-    source = Path(input_path).resolve()
-    dependencies = sorted(external_data_files(source))
-    with ArtifactStaging(prefix="qwen-gptq-", dir=None) as staging:
-        stage = staging.path
-        locations = {path: f"weights/{index}.data" for index, path in enumerate(dependencies)}
-        for path, location in locations.items():
-            target = stage / location
-            target.parent.mkdir(exist_ok=True)
-            # ONNX rejects external tensor files with multiple hard links.
-            shutil.copy2(path, target)
-        model = onnx.load(source, load_external_data=False)
-        external_bytes = 0
-        for tensor in model_tensors(model):
-            if tensor.data_location != onnx.TensorProto.EXTERNAL:
-                continue
-            info = get_external_info(tensor)
-            dependency = (source.parent / info["location"]).resolve()
-            external_bytes += int(info.get("length", str(dependency.stat().st_size - int(info.get("offset", "0")))))
-            for entry in tensor.external_data:
-                if entry.key == "location":
-                    entry.value = locations[dependency]
+    with isolated_onnx_input(input_path, prefix="qwen-gptq-") as (staged_model, stage):
+        model = onnx.load(staged_model, load_external_data=False)
+        external_bytes = sum(
+            external_tensor_range(stage, tensor)[2]
+            for tensor in model_tensors(model)
+            if tensor.data_location == onnx.TensorProto.EXTERNAL
+        )
         if model.ByteSize() + external_bytes < onnx.checker.MAXIMUM_PROTOBUF:
             # GPTQ runs smaller graphs from bytes, which cannot resolve adjacent data files.
             onnx.external_data_helper.load_external_data_for_model(model, str(stage))
-        staged_model = stage / "model.onnx"
-        staged_model.write_bytes(model.SerializeToString())
+            staged_model.write_bytes(model.SerializeToString())
         yield str(staged_model), str(stage)
-        staging.mark_complete()
 
 
 def quantize_decoder(

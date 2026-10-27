@@ -327,3 +327,14 @@ def test_pipeline_compares_decoded_text_with_each_actual_tokenizer(tmp_path, mon
     else:
         validate.validate_pipeline(*args, onnx_tokenizer=artifact)
         assert "PASS: Text matches" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("value,accepted", [(1.11, False), (0.905, True)])
+def test_relative_tolerance_scales_reference_features(value, accepted):
+    reference = np.ones((1, 2, 3), dtype=np.float64)
+    actual = np.full(reference.shape, value)
+    if accepted:
+        validate.compare_features(reference, actual, "relative tolerance", atol=0, rtol=0.1)
+    else:
+        with pytest.raises(ValueError, match="exceed"):
+            validate.compare_features(reference, actual, "relative tolerance", atol=0, rtol=0.1)

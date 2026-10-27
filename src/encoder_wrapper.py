@@ -20,6 +20,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .onnx_export import export_onnx
+
 CONV_WINDOW = 100  # n_window * 2
 TOKENS_PER_WINDOW = 13  # tokens output by conv on a full 100-frame window
 ATTN_WINDOW_SIZE = 104  # TOKENS_PER_WINDOW * (n_window_infer // conv_window) = 13 * 8
@@ -232,7 +234,7 @@ def export_encoder(
         )
 
     with torch.no_grad():
-        torch.onnx.export(
+        n = export_onnx(
             wrapper,
             (dummy_mel,),
             output_path,
@@ -244,10 +246,6 @@ def export_encoder(
             },
             opset_version=opset_version,
             do_constant_folding=True,
-            dynamo=False,
         )
 
-    from .onnx_fixup import fix_reshape_allowzero
-
-    n = fix_reshape_allowzero(output_path)
     print(f"Encoder exported to {output_path} (fixed {n} Reshape allowzero attrs)")

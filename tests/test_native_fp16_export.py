@@ -16,7 +16,8 @@ from src.native_encoder import run_native_encoder
 from tests.encoder_helpers import FRAME_LENGTHS
 
 
-def test_native_fp16_main_exports_dynamic_fp32_io(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("retained_data", [False, True])
+def test_native_fp16_main_exports_dynamic_fp32_io(tmp_path, monkeypatch, capsys, retained_data):
     with torch.random.fork_rng():
         torch.manual_seed(4342)
         config = Qwen3ASRAudioEncoderConfig(
@@ -41,6 +42,23 @@ def test_native_fp16_main_exports_dynamic_fp32_io(tmp_path, monkeypatch, capsys)
             return model
 
         path = tmp_path / "encoder.fp16.onnx"
+        if retained_data:
+            tensor = onnx.numpy_helper.from_array(np.array([42], dtype=np.float32), "retained")
+            onnx.external_data_helper.set_external_data(tensor, path.name + ".data", offset=0, length=4)
+            tensor.ClearField("raw_data")
+            aux = onnx.helper.make_model(
+                onnx.helper.make_graph(
+                    [onnx.helper.make_node("Identity", ["retained"], ["out"])],
+                    "retained",
+                    [],
+                    [onnx.helper.make_tensor_value_info("out", onnx.TensorProto.FLOAT, [1])],
+                    [tensor],
+                ),
+                opset_imports=[onnx.helper.make_opsetid("", 17)],
+                ir_version=9,
+            )
+            (tmp_path / (path.name + ".data")).write_bytes(np.array([42], dtype=np.float32).tobytes())
+            onnx.save(aux, tmp_path / "aux.onnx")
         monkeypatch.setattr(export, "load_model", load_tiny_model)
         monkeypatch.setattr(
             sys,
@@ -58,6 +76,11 @@ def test_native_fp16_main_exports_dynamic_fp32_io(tmp_path, monkeypatch, capsys)
         )
         native_fp16.main()
 
+    if retained_data:
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 1
+        session = ort.InferenceSession(str(tmp_path / "aux.onnx"), options, providers=["CPUExecutionProvider"])
+        assert float(session.run(None, {})[0][0]) == 42.0
     assert "ORT OK:" in capsys.readouterr().out
     graph = onnx.load(str(path))
     onnx.checker.check_model(graph)

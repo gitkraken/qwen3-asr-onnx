@@ -83,6 +83,12 @@ uv export --locked --no-dev --format requirements-txt --output-file requirements
 | RTN or GPTQ | 8 | any | Reject before output creation |
 | GPTQ | 4 | requested | Reject before output creation |
 
+Quantization checks that every external tensor occurrence is covered by the pinned
+ONNX loader and writer. Unsupported placements, including sparse values/indices,
+training graphs and function-default attributes, are rejected before mutation.
+Path-based quantizers stage the input closure so ORT inference files cannot replace
+source weights. Scratch cleanup belongs to the producer rather than filename patterns.
+
 An all-excluded/no-quantized-node model is rejected instead of receiving an int4
 label. GPTQ receives an isolated model and its external-data closure, never the
 exporter's adjacent configuration. External data is copied, because ONNX rejects
@@ -121,6 +127,12 @@ its owning decoders; an encoder or another variant cannot claim that destination
 Copied assets and rewritten configuration replace directory entries so an existing
 link cannot change retained bytes.
 
+Legacy Torch exports run in private staging because their external filenames can
+come from tensor names shared by different graphs. Before publication, validated
+external ranges are streamed into `<graph>.onnx.data`, then the graph and weights
+are published together with rollback. The destination graph is checked before
+publication. Staging temporarily needs additional space for consolidated weights.
+
 Packages require complete graph sets plus their actual external-data references,
 configuration, tokenizer and embeddings. Inline, per-decoder and shared weights
 are alternatives. The release and archives are staged and validated before
@@ -141,9 +153,14 @@ completed publication report the leftover path and completed state; a primary
 operation error keeps its identity when staging cleanup raises an `OSError`.
 This does not make an entire
 converter invocation transactional. An archive or validation failure is a failed
-command. Standalone archives include the ONNX external-data closure and replace a
-prior tar only after a complete staged write. Tokenizer validation uses built-in
-classes; local asset metadata cannot authorize Python modules. Kepler continues
+command. Standalone archives use the same release validator as packages: complete
+graph triples, finite metadata-consistent embeddings, preprocessing metadata, ASR
+tokenizer, strict ONNX checking and CPU runtime loading. They include the actual
+ONNX external-data closure and replace a prior tar only after a complete staged write. Tokenizer validation uses built-in
+classes; local asset metadata cannot authorize Python modules. The shared tokenizer
+loader validates selected ASR roles, delimiters, context and language forcing before
+returning, so calibration and evaluation inherit the same prompt contract. Family
+validation additionally checks every shipped template representation. Kepler continues
 using its own manifest-driven publisher.
 
 ## Shared-weight recovery

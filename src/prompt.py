@@ -23,7 +23,38 @@ def load_prompt_tokenizer(model_id: str, *, local_files_only: bool = False):
             raise ValueError(f"Missing official chat_template.json for {model_id}")
         with open(template_path) as stream:
             tokenizer.chat_template = json.load(stream)["chat_template"]
+    validate_prompt_tokenizer(tokenizer)
     return tokenizer
+
+
+def validate_prompt_tokenizer(tokenizer) -> None:
+    special = {
+        "<|endoftext|>": ENDOFTEXT_TOKEN_ID,
+        "<|im_start|>": IM_START_TOKEN_ID,
+        "<|im_end|>": IM_END_TOKEN_ID,
+        "<|audio_start|>": AUDIO_START_TOKEN_ID,
+        "<|audio_end|>": AUDIO_END_TOKEN_ID,
+        "<|audio_pad|>": AUDIO_PAD_TOKEN_ID,
+        "<asr_text>": ASR_TEXT_TOKEN_ID,
+    }
+    for token, expected in special.items():
+        if tokenizer.convert_tokens_to_ids(token) != expected:
+            raise ValueError(f"Tokenizer has an invalid ASR special token: {token}")
+    for role in ("system", "user", "assistant"):
+        ids = tokenizer.encode(role, add_special_tokens=False)
+        if not ids or tokenizer.unk_token_id in ids:
+            raise ValueError(f"Tokenizer cannot encode the {role} role")
+    for context, language in (("", None), ("Kepler", None), ("", "English"), ("Kepler", "English")):
+        actual = build_prompt_ids(2, tokenizer, context=context, language=language)
+        expected_text = (
+            f"<|im_start|>system\n{context}<|im_end|>\n"
+            "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_pad|><|audio_end|><|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+        if language is not None:
+            expected_text += f"language {language}<asr_text>"
+        if actual != tokenizer.encode(expected_text, add_special_tokens=False):
+            raise ValueError("Tokenizer chat template does not implement the Qwen3-ASR prompt contract")
 
 
 def get_feat_extract_output_lengths(input_lengths: int) -> int:

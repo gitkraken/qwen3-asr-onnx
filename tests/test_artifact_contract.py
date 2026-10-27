@@ -344,14 +344,16 @@ def test_unusable_tokenizer_contract_preserves_previous_release(tmp_path, proble
         (source / "chat_template.jinja").write_text("{{ messages[0].content }}")
     else:
         (source / "tokenizer.json").write_text("{}")
-    validate = pack.validate_tokenizer_assets
+    from src import release_validation
+
+    validate = release_validation.validate_tokenizer_assets
     reached = []
 
     def validate_and_record(root):
         reached.append(Path(root).name)
         return validate(root)
 
-    monkeypatch.setattr(pack, "validate_tokenizer_assets", validate_and_record)
+    monkeypatch.setattr(release_validation, "validate_tokenizer_assets", validate_and_record)
     assert not pack.package(str(source), str(output))
     assert reached == ["source"]
     assert {p.relative_to(output): p.read_bytes() for p in output.rglob("*") if p.is_file()} == previous

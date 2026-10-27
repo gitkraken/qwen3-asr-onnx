@@ -8,22 +8,14 @@ import shutil
 import tarfile
 from pathlib import Path, PurePosixPath
 
-import onnx
-import onnxruntime as ort
-
 from share_weights import share_external_models
 from src.artifact_metadata import MODEL_METADATA_FILES
 from src.artifact_publication import ArtifactStaging, publish_artifacts
 from src.embeddings import load_embed_tokens
-from src.onnx_artifacts import graph_file_closure, inventory_graphs, transport_graph_files
-from src.tokenizer_assets import tokenizer_asset_names, validate_tokenizer_assets
-
-REQUIRED_METADATA = [*MODEL_METADATA_FILES, "tokenizer.json", "tokenizer_config.json"]
-
-
-def _graph_names(suffix=""):
-    tag = f".{suffix}" if suffix else ""
-    return [f"encoder{tag}.onnx", f"decoder_init{tag}.onnx", f"decoder_step{tag}.onnx"]
+from src.onnx_artifacts import graph_file_closure, transport_graph_files
+from src.release_validation import REQUIRED_METADATA, validate_release, validate_release_metadata
+from src.release_validation import graph_names as _graph_names
+from src.tokenizer_assets import tokenizer_asset_names
 
 
 def copy_file(src, dst, hardlink=False):
@@ -36,22 +28,6 @@ def copy_file(src, dst, hardlink=False):
             shutil.copy2(src, dst)
     else:
         shutil.copy2(src, dst)
-
-
-def verify_ort_load(output_dir):
-    opts = ort.SessionOptions()
-    opts.log_severity_level = 3
-    opts.intra_op_num_threads = 1
-    opts.inter_op_num_threads = 1
-    try:
-        for name in sorted(inventory_graphs(output_dir)):
-            path = Path(output_dir) / name
-            onnx.checker.check_model(str(path))
-            ort.InferenceSession(str(path), opts, providers=["CPUExecutionProvider"])
-        return True
-    except Exception as error:
-        print(f"ORT verification failed: {error}")
-        return False
 
 
 def _create_archive(root, target, names, archive_root):
@@ -109,15 +85,7 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
             raise ValueError(f"Input directory overlaps publication destination: {target}")
     if output.is_symlink():
         raise ValueError("Output cannot be a symlink")
-    for name in REQUIRED_METADATA + ["embed_tokens.bin"]:
-        if not (source / name).is_file():
-            raise ValueError(f"Required artifact missing: {name}")
-    for name in REQUIRED_METADATA:
-        with (source / name).open() as stream:
-            metadata = json.load(stream)
-        if not isinstance(metadata, dict):
-            raise ValueError(f"Required metadata must be a JSON object: {name}")
-    validate_tokenizer_assets(source)
+    validate_release_metadata(source)
     variants = [variant for variant in ("", "int4") if any((source / name).exists() for name in _graph_names(variant))]
     if not variants:
         raise ValueError("No model variants found")
@@ -185,10 +153,7 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
         for path in release.rglob("*"):
             if path.is_file() and path.relative_to(release).as_posix() not in complete:
                 path.unlink()
-        if not verify_ort_load(release):
-            raise ValueError("Release failed ONNX/ORT verification")
-        load_embed_tokens(release)
-        validate_tokenizer_assets(release)
+        validate_release(release, (name for variant in variants for name in _graph_names(variant)))
         replacements = [(release, output)]
         for variant in variants:
             base = output.name + ("-int4" if variant else "")

@@ -309,7 +309,8 @@ def test_archive_materializes_linked_template_bytes(tmp_path):
     retained_template = tmp_path / "template.jinja"
     (source / "chat_template.jinja").rename(retained_template)
     (source / "chat_template.jinja").symlink_to(retained_template)
-    path = create_tar({"name": "bundle", "source_dir": str(source), "files": []}, str(tmp_path))
+    names = ["encoder.onnx", "decoder_init.onnx", "decoder_step.onnx"]
+    path = create_tar({"name": "bundle", "source_dir": str(source), "files": names}, str(tmp_path))
     with tarfile.open(path) as archive:
         assert archive.getmember("bundle/chat_template.jinja").isfile()
         archive.extractall(tmp_path / "extracted", filter="data")

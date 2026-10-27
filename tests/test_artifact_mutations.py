@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -285,7 +286,14 @@ def test_source_reader_template_directory_rejected_without_publishing(tmp_path):
 
 @pytest.mark.parametrize(
     "operation,prefix",
-    [("package", ".package-"), ("tokenizer", ".tokenizer-"), ("archive", ".archive-"), ("sharing", ".share-")],
+    [
+        ("package", ".package-"),
+        ("tokenizer", ".tokenizer-"),
+        ("archive", ".archive-"),
+        ("sharing", ".share-"),
+        ("copy", ".artifact-"),
+        ("metadata", ".artifact-"),
+    ],
 )
 def test_published_artifacts_survive_staging_cleanup_error(tmp_path, monkeypatch, capsys, operation, prefix):
     from create_tar import create_tar
@@ -313,6 +321,12 @@ def test_published_artifacts_survive_staging_cleanup_error(tmp_path, monkeypatch
         elif operation == "tokenizer":
             copy_tokenizer_assets(source, target)
             validate_tokenizer_assets(target)
+        elif operation == "copy":
+            share_weights.copy_artifact_entry(source, target, "tokenizer_config.json")
+            assert (target / "tokenizer_config.json").read_bytes() == (source / "tokenizer_config.json").read_bytes()
+        elif operation == "metadata":
+            share_weights.write_artifact_json(target, "config.json", {"written": True})
+            assert json.loads((target / "config.json").read_text()) == {"written": True}
         elif operation == "sharing":
             assert share_weights.share_external_models(source)
             assert share_weights.external_data_files(source / "decoder_step.onnx") == {source / "decoder_weights.data"}

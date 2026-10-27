@@ -39,9 +39,6 @@ from src.onnx_artifacts import (
     model_tensors as model_tensors,
 )
 from src.onnx_artifacts import (
-    protect_retained_graphs as protect_retained_graphs,
-)
-from src.onnx_artifacts import (
     transport_graph_files as transport_graph_files,
 )
 from src.onnx_artifacts import (

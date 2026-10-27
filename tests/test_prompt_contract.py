@@ -96,7 +96,7 @@ def test_export_verifies_template_role_names(tokenizer, monkeypatch):
     monkeypatch.setattr(export, "load_prompt_tokenizer", lambda model: tokenizer)
     export.verify_special_tokens("fixture")
     tokenizer.chat_template = tokenizer.chat_template.replace("system\\n", "bogus\\n")
-    with pytest.raises(ValueError, match="role names"):
+    with pytest.raises(ValueError, match="prompt contract"):
         export.verify_special_tokens("fixture")
 
 
@@ -121,16 +121,15 @@ def test_export_config_records_real_embedding_shape_and_cache_dtype(tmp_path):
     assert saved["embed_tokens_dtype"] == "float32"
 
 
-def test_loads_official_processor_template_when_tokenizer_has_none(tmp_path, monkeypatch):
+def test_loads_official_processor_template_when_tokenizer_has_none(tmp_path, monkeypatch, tokenizer):
     import json
-    from types import SimpleNamespace
 
     import transformers
     import transformers.utils
 
     path = tmp_path / "chat_template.json"
     path.write_text(json.dumps({"chat_template": OFFICIAL_CHAT_TEMPLATE}))
-    tokenizer = SimpleNamespace(chat_template=None)
+    tokenizer.chat_template = None
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: tokenizer)
     requests = []
 
@@ -176,6 +175,7 @@ def test_export_rejects_selected_template_that_discards_context(tmp_path):
     save_tokenizer_assets(source)
     path = source / "chat_template.jinja"
     path.write_text(path.read_text().replace("ns.system_text if ns.system_text is string else ''", "''"))
-    export.verify_special_tokens(str(source))
-    with pytest.raises(ValueError, match="Invalid ASR tokenizer assets"):
+    with pytest.raises(ValueError, match="prompt contract"):
+        export.verify_special_tokens(str(source))
+    with pytest.raises(ValueError, match="prompt contract"):
         export.copy_tokenizer(str(source), str(target))

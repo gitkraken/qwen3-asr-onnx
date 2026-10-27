@@ -42,6 +42,7 @@ from share_weights import share_external_models
 from src.artifact_metadata import MODEL_METADATA_FILES
 from src.onnx_artifacts import (
     copy_artifact_entry,
+    isolated_onnx_input,
     preflight_artifact_mutations,
     write_artifact_json,
 )
@@ -239,19 +240,20 @@ def quantize_decoder(
         "WeightSymmetric": True,
     }
 
-    quantize_static(
-        input_path,
-        output_path,
-        calibration_data_reader=reader,
-        quant_format=quant_format,
-        activation_type=QuantType.QInt8,
-        weight_type=QuantType.QInt8,
-        per_channel=per_channel,
-        calibrate_method=calibrate_method,
-        nodes_to_exclude=nodes_to_exclude or [],
-        use_external_data_format=True,
-        extra_options=extra_options,
-    )
+    with isolated_onnx_input(input_path) as (staged_model, _stage):
+        quantize_static(
+            str(staged_model),
+            output_path,
+            calibration_data_reader=reader,
+            quant_format=quant_format,
+            activation_type=QuantType.QInt8,
+            weight_type=QuantType.QInt8,
+            per_channel=per_channel,
+            calibrate_method=calibrate_method,
+            nodes_to_exclude=nodes_to_exclude or [],
+            use_external_data_format=True,
+            extra_options=extra_options,
+        )
 
     # Report sizes
     in_size = os.path.getsize(input_path)

@@ -202,7 +202,7 @@ def compare_features(reference, actual, label, *, atol=1e-4, rtol=0.0):
     print(
         f"{label}: max absolute diff {error.max():.6e}, mean {error.mean():.6e}, relative L2 {relative_l2:.6e}, atol={atol}, rtol={rtol}"
     )
-    if not np.allclose(reference, actual, atol=atol, rtol=rtol):
+    if not np.allclose(actual, reference, atol=atol, rtol=rtol):
         raise ValueError(f"{label}: encoder features exceed atol={atol}, rtol={rtol}")
     print(f"PASS: {label}")
 

@@ -16,13 +16,14 @@ Usage (separate output dir):
 import argparse
 import json
 import os
-import tempfile
+from pathlib import Path
 
 import onnx
 from onnxruntime.quantization import QuantType, quantize_dynamic
 
 from src.onnx_artifacts import (
     copy_artifact_entry,
+    isolated_onnx_input,
     preflight_artifact_mutations,
     write_artifact_json,
 )
@@ -46,7 +47,7 @@ def _total_size(path: str) -> int:
     return size
 
 
-def _simplify_if_needed(input_path: str) -> str:
+def _simplify_if_needed(input_path: str, directory: Path) -> str:
     """Try to simplify the model with onnxsim to fix shape inference issues.
 
     Returns the path to use for quantization (temp file if simplified, original otherwise).
@@ -57,11 +58,10 @@ def _simplify_if_needed(input_path: str) -> str:
         model = onnx.load(input_path, load_external_data=True)
         model_sim, ok = onnxsim.simplify(model)
         if ok:
-            tmpfile = tempfile.NamedTemporaryFile(suffix=".onnx", delete=False)  # noqa: SIM115
-            tmpfile.close()  # Close before writing so onnx.save can open it on all platforms
-            onnx.save(model_sim, tmpfile.name)
+            simplified = directory / "simplified.onnx"
+            onnx.save(model_sim, simplified)
             print("    Simplified for shape inference compatibility")
-            return tmpfile.name
+            return str(simplified)
     except Exception:
         pass
     return input_path
@@ -94,19 +94,13 @@ def quantize_onnx_file(
     if nodes_to_exclude:
         quant_kwargs["nodes_to_exclude"] = nodes_to_exclude
 
-    # Try direct quantization first, fall back to simplification
-    tmp_path = None
-    try:
+    with isolated_onnx_input(input_path) as (staged_model, stage):
         try:
-            quantize_dynamic(input_path, output_path, **quant_kwargs)
-        except Exception as e:
-            # Shape inference may fail on dynamo-exported models; simplify first
-            print(f"    Direct quantization failed ({e}), retrying with onnxsim")
-            tmp_path = _simplify_if_needed(input_path)
-            quantize_dynamic(tmp_path, output_path, **quant_kwargs)
-    finally:
-        if tmp_path and tmp_path != input_path:
-            os.unlink(tmp_path)
+            quantize_dynamic(str(staged_model), output_path, **quant_kwargs)
+        except Exception as error:
+            print(f"    Direct quantization failed ({error}), retrying with onnxsim")
+            simplified = _simplify_if_needed(str(staged_model), stage)
+            quantize_dynamic(simplified, output_path, **quant_kwargs)
 
     in_size = _total_size(input_path)
     out_size = _total_size(output_path)
@@ -153,6 +147,19 @@ def main():
         if os.path.isfile(os.path.join(args.input, name))
     }
     generated = generated_graphs | {f"{name}.data" for name in generated_graphs}
+    retained_graphs = {
+        path.name for path in Path(args.output).glob(f"*{suffix}.onnx") if path.is_file()
+    } - generated_graphs
+    previous_quantization = {}
+    prior_config = Path(args.output) / "config.json"
+    if prior_config.is_file():
+        prior = json.loads(prior_config.read_text())
+        prior_quantization = prior.get("quantization", {})
+        if isinstance(prior_quantization, dict):
+            previous_quantization = {
+                name: tag for name, tag in prior_quantization.items() if f"{name}{suffix}.onnx" in retained_graphs
+            }
+    files.discard("config.json")
     tokenizer_files = tokenizer_asset_names(args.input)
     files = preflight_artifact_mutations(
         args.input,
@@ -204,7 +211,7 @@ def main():
     # Embed encoder weights into the INT8 .onnx proto (eliminates .data file)
     encoder_out = os.path.join(args.output, f"encoder{suffix}.onnx")
     encoder_data = encoder_out + ".data"
-    if os.path.exists(encoder_data):
+    if f"encoder{suffix}.onnx" in generated_graphs and os.path.exists(encoder_data):
         print("  Embedding INT8 encoder weights into .onnx proto...")
         enc = onnx.load(encoder_out, load_external_data=True)
         onnx.save(enc, encoder_out)
@@ -213,7 +220,7 @@ def main():
     # Inline quantized decoder_step weights into .onnx proto if under 2 GB.
     step_out = os.path.join(args.output, f"decoder_step{suffix}.onnx")
     step_data = step_out + ".data"
-    if os.path.exists(step_data):
+    if f"decoder_step{suffix}.onnx" in generated_graphs and os.path.exists(step_data):
         step_size = os.path.getsize(step_data)
         if step_size < 1.8e9:  # safe margin under 2 GB protobuf limit
             print("\nInlining INT8 decoder_step weights into .onnx proto...")
@@ -232,20 +239,18 @@ def main():
     if tokenizer_asset_names(args.input):
         copy_tokenizer_assets(args.input, args.output)
 
-    # Update config.json quantization metadata
-    config_path = os.path.join(args.output, "config.json")
-    if os.path.exists(config_path):
-        with open(config_path) as f:
-            config = json.load(f)
-    else:
-        config_src = os.path.join(args.input, "config.json")
-        with open(config_src) as f:
-            config = json.load(f)
+    config_path = Path(args.input) / "config.json"
+    if not config_path.is_file():
+        config_path = Path(args.output) / "config.json"
+    config = json.loads(config_path.read_text())
     quant_info = config.get("quantization", {})
     if isinstance(quant_info, str):
         quant_info = {}
-    for name in ["encoder", "decoder_init", "decoder_step"]:
-        quant_info[name] = f"{args.weight_type}_dynamic"
+    for graph in retained_graphs:
+        quant_info.pop(graph.removesuffix(f"{suffix}.onnx"), None)
+    quant_info.update(previous_quantization)
+    for graph in generated_graphs:
+        quant_info[graph.removesuffix(f"{suffix}.onnx")] = f"{args.weight_type}_dynamic"
     config["quantization"] = quant_info
     write_artifact_json(args.output, "config.json", config)
     print("  Updated config.json with quantization metadata")

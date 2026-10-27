@@ -3,12 +3,15 @@ import json
 import math
 import os
 import shutil
-import tempfile
+from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 
 import onnx
 from google.protobuf.descriptor import FieldDescriptor
 from google.protobuf.message import DecodeError
+
+from src.artifact_publication import ArtifactStaging
 
 
 def storage_tensors(message, initializer=False):
@@ -123,6 +126,20 @@ def preflight_artifact_mutations(
     copied_graphs = files & incoming.keys()
     dependencies = set().union(*(incoming[name] for name in copied_graphs))
     files.update(dependencies)
+    validate_destination_parents(destination_root, files | generated | rewritten | removed | assets)
+    selected_reads = copied_graphs | {name for name in reads if (source / name).is_file()}
+    source_graphs = {source / name for name in selected_reads}
+    source_dependencies = set().union(*(external_data_files(path) for path in source_graphs))
+    if source == output:
+        protected_source = source_dependencies
+        source_mutations = generated | rewritten | removed
+    else:
+        source_entries = source_graphs | {source / name for name in files}
+        protected_source = source_dependencies | source_entries | {path.resolve() for path in source_entries}
+        source_mutations = files | generated | rewritten | removed | assets
+    source_conflicts = {name for name in source_mutations if output / name in protected_source}
+    if source_conflicts:
+        raise ValueError(f"ONNX source graph destination conflict: {', '.join(sorted(source_conflicts))}")
     conflicts = (files & generated) | (dependencies & (rewritten | removed))
     if source == output:
         read_dependencies = set().union(*(incoming[name] for name in reads if name in incoming))
@@ -174,61 +191,101 @@ def transport_graph_files(root, graphs, generated=(), rewritten=()):
     return files
 
 
-def protect_retained_graphs(source, output, graphs, copies, *, generated=(), rewritten=(), removed=()):
-    source, output = Path(source).resolve(), Path(output).resolve()
-    reserved = graph_file_closure(output, graphs)
-    copies = set(copies)
-    conflicts = reserved & (set(generated) | set(rewritten) | set(removed))
-    for name in copies & reserved:
-        original, retained = source / name, output / name
-        if original.stat().st_size == retained.stat().st_size and file_digest(original) == file_digest(retained):
-            copies.remove(name)
-        else:
-            conflicts.add(name)
-    if conflicts:
-        raise ValueError(f"ONNX retained graph destination conflict: {', '.join(sorted(conflicts))}")
-    return copies
+def validate_destination_parents(output, names):
+    root = Path(output).resolve()
+    for name in names:
+        relative = Path(name)
+        parent = (root / relative).parent
+        if relative.is_absolute() or ".." in relative.parts or not parent.is_relative_to(root):
+            raise ValueError(
+                f"ONNX transport destination conflict: artifact destination escapes output directory: {name}"
+            )
+        if parent.resolve() != parent:
+            raise ValueError(f"ONNX transport destination conflict: linked parent directory: {name}")
 
 
 def validate_generated_destinations(output, names):
     root = Path(output).absolute()
     if root.is_symlink():
         raise ValueError(f"ONNX transport destination conflict: linked output directory {root}")
-    resolved_root = root.resolve()
+    validate_destination_parents(root, names)
     for name in names:
         destination = root / name
-        if not destination.parent.resolve().is_relative_to(resolved_root):
-            raise ValueError(f"ONNX transport destination conflict: {name}")
         if destination.is_symlink() or (destination.exists() and destination.stat().st_nlink > 1):
             raise ValueError(f"ONNX transport destination conflict: linked {name}")
+        if destination.exists() and not destination.is_file():
+            raise ValueError(f"ONNX transport destination conflict: not a regular file: {name}")
 
 
 def copy_artifact_entry(source, output, name):
     root = Path(output).resolve()
-    destination = Path(output) / name
-    if not destination.parent.resolve().is_relative_to(root):
-        raise ValueError(f"Artifact destination escapes output directory: {name}")
+    validate_destination_parents(root, [name])
+    destination = root / name
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if not destination.parent.resolve().is_relative_to(root):
-        raise ValueError(f"Artifact destination escapes output directory: {name}")
-    with tempfile.NamedTemporaryFile(prefix=".artifact-", dir=destination.parent, delete=False) as temporary:
-        staged = Path(temporary.name)
-    try:
+    validate_destination_parents(root, [name])
+    with ArtifactStaging(prefix=".artifact-", dir=destination.parent) as staging:
+        staged = staging.path / "entry"
         shutil.copy2(Path(source) / name, staged)
         os.replace(staged, destination)
-    finally:
-        staged.unlink(missing_ok=True)
+        staging.mark_complete()
 
 
 def write_artifact_json(output, name, value):
-    destination = Path(output) / name
+    root = Path(output).resolve()
+    validate_destination_parents(root, [name])
+    destination = root / name
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".artifact-", dir=destination.parent) as temp:
-        staged = Path(temp) / "value.json"
+    validate_destination_parents(root, [name])
+    with ArtifactStaging(prefix=".artifact-", dir=destination.parent) as staging:
+        staged = staging.path / "value.json"
         with staged.open("w") as stream:
             json.dump(value, stream, indent=2)
         staged.chmod(0o644)
         os.replace(staged, destination)
+        staging.mark_complete()
+
+
+def validate_quantization_storage(model):
+    def external_occurrences(tensors):
+        return Counter(
+            tensor.SerializeToString(deterministic=True)
+            for tensor in tensors
+            if tensor.data_location == onnx.TensorProto.EXTERNAL
+        )
+
+    requested = external_occurrences(model_tensors(model))
+    # ONNX loading and saving share this narrower traversal, so metadata storage can be lost.
+    supported = external_occurrences(onnx.external_data_helper._get_all_tensors(model))
+    if requested != supported:
+        raise ValueError("Quantization of this external tensor storage is unsupported by ONNX's loader and writer")
+
+
+@contextmanager
+def isolated_onnx_input(input_path, *, prefix="qwen-onnx-"):
+    source = Path(input_path).resolve()
+    model = onnx.load(source, load_external_data=False)
+    validate_quantization_storage(model)
+    dependencies = sorted(external_data_files(source))
+    with ArtifactStaging(prefix=prefix, dir=None) as staging:
+        stage = staging.path
+        # ORT writes inferred graphs beside its input; tensor storage needs a separate namespace.
+        locations = {path: f"weights/{index}.data" for index, path in enumerate(dependencies)}
+        for path, location in locations.items():
+            target = stage / location
+            target.parent.mkdir(exist_ok=True)
+            shutil.copy2(path, target)
+        for tensor in model_tensors(model):
+            if tensor.data_location != onnx.TensorProto.EXTERNAL:
+                continue
+            info = get_external_info(tensor)
+            dependency = (source.parent / info["location"]).resolve()
+            for entry in tensor.external_data:
+                if entry.key == "location":
+                    entry.value = locations[dependency]
+        staged_model = stage / "model.onnx"
+        staged_model.write_bytes(model.SerializeToString())
+        yield staged_model, stage
+        staging.mark_complete()
 
 
 def file_digest(path):
