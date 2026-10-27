@@ -150,10 +150,10 @@ python optimize_graphs.py --input output/qwen3-asr-1.7b
 ```
 
 Applies ORT transformer optimizer fusions that the runtime optimizer does not perform:
-- **Decoders:** Fuses decomposed RMSNorm into `SimplifiedLayerNormalization` — 7% speedup on FP32, 4% on int4 ([111], [113])
+- **Decoders:** Retains supported skip-RMS fusions. Standalone RMSNorm uses a model-local ONNX function with FP32 normalization followed by activation-dtype scaling. This avoids serializing ORT's unregistered default-domain `SimplifiedLayerNormalization` and preserves the graph's existing opset.
 - **Encoder:** Fuses `SkipLayerNormalization` (skip-connection + LayerNorm) and `BiasGelu` — ~4% speedup when int4 decoders make the encoder the bottleneck ([112])
 
-Must be applied to FP32 graphs before quantization so that int4 weights are calibrated against the fused kernels ([113]).
+Apply optimization to FP32 graphs before quantization. The saved graphs must pass the ONNX checker. Historical decoder fusion speedups do not establish the performance of the portable function; measure the resulting exports.
 
 ### 4. int4 MatMulNBits Quantization (recommended for both 0.6B and 1.7B)
 
@@ -244,7 +244,7 @@ uv run python validate.py \
     --onnx-dir output/qwen3-asr-0.6b \
     --audio tests/fixtures/test_audio.wav
 
-# Optimize encoder + decoders (fuses RMSNorm, SkipLayerNorm, BiasGelu — 4-7% speedup)
+# Optimize and validate encoder and decoder graphs
 uv run python optimize_graphs.py --input output/qwen3-asr-0.6b
 
 # int4 RTN al4 decoders (recommended)
@@ -271,7 +271,7 @@ uv run python validate.py \
     --onnx-dir output/qwen3-asr-1.7b \
     --audio tests/fixtures/test_audio.wav
 
-# Optimize encoder + decoders (fuses RMSNorm, SkipLayerNorm, BiasGelu — 4-7% speedup)
+# Optimize and validate encoder and decoder graphs
 uv run python optimize_graphs.py --input output/qwen3-asr-1.7b
 
 # int4 RTN al4 decoders (same as 0.6B — GPTQ provides no WER benefit, see experiment [109])

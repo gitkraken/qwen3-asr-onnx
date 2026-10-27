@@ -18,6 +18,19 @@ updating the fork pin. Do not rewrite provenance of older exports to name this
 fork. No improvement to transcription accuracy is implied by a feature parity fix.
 The separate int4 sensitivity report in upstream issue 2 remains unclaimed.
 
+## Portable RMS normalization
+
+ORT's default-domain `SimplifiedLayerNormalization` has no ONNX schema in the
+supported environment. The optimizer replaces standalone instances with a local
+`qwen3_asr::RMSNormalization` function using standard ONNX operations at the
+graph's existing opset. It computes normalization in FP32, casts the normalized
+result to the activation dtype, then scales it. The function body preserves that
+boundary through both supported FP16 converters. Opsets 17 and 18 are tested.
+Unsupported normalization attributes, axes, outputs or conflicting function
+definitions fail instead of silently changing the operation. Existing supported
+skip-RMS and encoder fusions remain available. Every saved graph is checked;
+full model fidelity and performance still require measured integration runs.
+
 ## Supported environment and checks
 
 Use Python 3.12.13 and uv 0.11.20. `pyproject.toml` declares the runtime and test
