@@ -70,6 +70,34 @@ def test_asset_copy_replaces_stale_templates_and_preserves_origin(tmp_path, temp
     _assert_source_assets(source, target)
 
 
+@pytest.mark.parametrize("template_format", ["embedded", "json"])
+@pytest.mark.parametrize("failed_name", ["tokenizer.json", "tokenizer_config.json"])
+def test_asset_publication_failure_restores_prior_tokenizer(tmp_path, monkeypatch, template_format, failed_name):
+    source, target = tmp_path / "source", tmp_path / "target"
+    save_tokenizer_assets(source, template_format=template_format)
+    save_tokenizer_assets(target, template_format="jinja")
+    before = {p.name: p.read_bytes() for p in target.iterdir()}
+    previous_ids = build_prompt_ids(3, validate_tokenizer_assets(target))
+    replace = os.replace
+    failed = False
+
+    def interrupt(src, dst):
+        nonlocal failed
+        if not failed and Path(src).parent.name.startswith(".tokenizer-") and Path(dst) == target / failed_name:
+            failed = True
+            raise OSError("injected tokenizer publication failure")
+        return replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", interrupt)
+    with pytest.raises(OSError, match="injected tokenizer"):
+        copy_tokenizer_assets(source, target)
+    assert failed
+    assert {p.name: p.read_bytes() for p in target.iterdir()} == before
+    assert build_prompt_ids(3, validate_tokenizer_assets(target)) == previous_ids
+    copy_tokenizer_assets(source, target)
+    _assert_source_assets(source, target)
+
+
 @pytest.mark.parametrize("problem", ["missing-template", "bad-template", "missing-tokenizer", "invalid-json"])
 def test_invalid_source_is_rejected_before_target_changes(tmp_path, problem):
     source, target = tmp_path / "source", tmp_path / "target"

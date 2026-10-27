@@ -4,8 +4,8 @@
 Data and both graphs are validated in staging. The canonical data file is
 published before either graph, and source data is retained until both graphs
 have been replaced. Individual replacements are atomic; the group is not.
-An interrupted run can retain an unreferenced custom data file. Conventional
-per-decoder data files are cleaned on retry, without deleting live references.
+Source data files are retained, including after a retry. Only a producer that
+owns the working directory can authorize their cleanup.
 """
 
 import argparse
@@ -121,20 +121,38 @@ def external_data_files(model_path):
 def graph_file_closure(root, names):
     root = Path(root).resolve()
     graphs = set(names)
-    files = set(graphs)
-    for name in graphs:
-        for path in external_data_files(root / name):
-            files.add(path.relative_to(root).as_posix())
-    return files
+    return graphs | _graph_dependencies(root, graphs)
+
+
+def _graph_dependencies(root, names):
+    return {path.relative_to(root).as_posix() for name in names for path in external_data_files(root / name)}
 
 
 def transport_graph_files(root, graphs, generated=(), rewritten=()):
+    root = Path(root).resolve()
     graphs = set(graphs)
-    files = graph_file_closure(root, graphs)
-    conflicts = (files & set(generated)) | ((files - graphs) & set(rewritten))
+    dependencies = _graph_dependencies(root, graphs)
+    files = graphs | dependencies
+    conflicts = (files & set(generated)) | (dependencies & set(rewritten))
     if conflicts:
         raise ValueError(f"ONNX transport destination conflict: {', '.join(sorted(conflicts))}")
     return files
+
+
+def protect_retained_graphs(source, output, graphs, copies, *, generated=(), rewritten=(), removed=()):
+    source, output = Path(source).resolve(), Path(output).resolve()
+    reserved = graph_file_closure(output, graphs)
+    copies = set(copies)
+    conflicts = reserved & (set(generated) | set(rewritten) | set(removed))
+    for name in copies & reserved:
+        original, retained = source / name, output / name
+        if original.stat().st_size == retained.stat().st_size and _file_digest(original) == _file_digest(retained):
+            copies.remove(name)
+        else:
+            conflicts.add(name)
+    if conflicts:
+        raise ValueError(f"ONNX retained graph destination conflict: {', '.join(sorted(conflicts))}")
+    return copies
 
 
 def validate_generated_destinations(output, names):
@@ -265,13 +283,6 @@ def _publish_data(staged, target):
     os.replace(staged, target)
 
 
-def _cleanup_data(root, names, live):
-    candidates = {root / f"{name}.data" for name in names}
-    for path in candidates - live:
-        if path.exists():
-            path.unlink()
-
-
 def _validate_models(root, names):
     for name in names:
         external_data_files(root / name)
@@ -298,23 +309,21 @@ def share_external_models(model_dir, suffix=None):
     models = [onnx.load(root / name, load_external_data=False) for name in names]
     old_files = set().union(*(external_data_files(root / name) for name in names))
     shared_name = _shared_data_name(suffix)
+    validate_generated_destinations(root, [shared_name])
     _validate_models(root, names)
     live = _live_data_files(root, {root / name for name in names})
+    already_shared = (root / shared_name).is_file() and bool(old_files) and old_files <= {root / shared_name}
+    if already_shared:
+        _validate_runtime_models(root, names)
+        return True
+    conflicts = live & {root / name for name in names}
+    if conflicts:
+        raise ValueError(f"ONNX transport destination conflict: {', '.join(sorted(path.name for path in conflicts))}")
     storage = [
         (tensor, _can_share(tensor, root, initializer))
         for model in models
         for tensor, initializer in _storage_tensors(model)
     ]
-    already_shared = (
-        (root / shared_name).is_file()
-        and bool(old_files)
-        and old_files <= {root / shared_name}
-        and all((tensor.data_location == onnx.TensorProto.EXTERNAL) == shareable for tensor, shareable in storage)
-    )
-    if already_shared:
-        _validate_runtime_models(root, names)
-        _cleanup_data(root, names, live)
-        return True
     # A process exit must not leave transient graphs inside the recursive consumer inventory.
     with tempfile.TemporaryDirectory(prefix=".share-", dir=root.parent) as tmp:
         stage = Path(tmp)
@@ -330,7 +339,6 @@ def share_external_models(model_dir, suffix=None):
         for name in names:
             os.replace(stage / name, root / name)
         _validate_models(root, names)
-    _cleanup_data(root, names, live)
     return True
 
 

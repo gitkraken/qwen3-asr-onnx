@@ -59,8 +59,27 @@ def _ort_result(path):
     opts.intra_op_num_threads = 1
     opts.inter_op_num_threads = 1
     session = ort.InferenceSession(str(path), opts, providers=["CPUExecutionProvider"])
-    dtype = np.float16 if session.get_inputs()[0].type == "tensor(float16)" else np.float32
-    return session.run(None, {"x": np.ones((1, 32), dtype=dtype)})[0]
+    feed = {
+        item.name: np.ones(item.shape, dtype=np.float16 if item.type == "tensor(float16)" else np.float32)
+        for item in session.get_inputs()
+    }
+    return session.run(None, feed)[0]
+
+
+def _write_external_identity(root, name, location, offset=0, dtype=np.float32):
+    from share_weights import set_tensor_external
+
+    tensor = numpy_helper.from_array(np.zeros(1, dtype=dtype), name="value")
+    set_tensor_external(tensor, location, offset, np.dtype(dtype).itemsize)
+    graph = helper.make_graph(
+        [helper.make_node("Identity", ["value"], ["output"])],
+        "external-identity",
+        [],
+        [helper.make_tensor_value_info("output", tensor.data_type, [1])],
+        [tensor],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=10)
+    (root / name).write_bytes(model.SerializeToString())
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float16"])
@@ -528,3 +547,55 @@ def test_publication_can_replace_recognized_archive(tmp_path):
     assert pack.package(source, output)
     for name in ("encoder.onnx", "decoder_init.onnx", "decoder_step.onnx"):
         np.testing.assert_array_equal(_ort_result(source / name), _ort_result(output / name))
+
+
+def test_package_rejects_graphs_used_as_rewritten_tensor_storage(tmp_path):
+    source = _release_input(tmp_path / "source")
+    data = (source / "decoder_init.onnx").read_bytes()
+    offset = data.index(np.arange(512, dtype=np.float32).tobytes())
+    _write_external_identity(source, "encoder.onnx", "decoder_init.onnx", offset)
+    np.testing.assert_array_equal(_ort_result(source / "encoder.onnx"), [0])
+    before = {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+    output = tmp_path / "release"
+    output.mkdir()
+    (output / "sentinel").write_bytes(b"previous release")
+    assert not pack.package(source, output)
+    assert {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()} == before
+    assert (output / "sentinel").read_bytes() == b"previous release"
+
+
+def test_package_rejects_audio_destination_used_as_tensor_storage(tmp_path):
+    source = _release_input(tmp_path / "source")
+    (source / "test_wavs").mkdir()
+    np.ones(1, dtype=np.float32).tofile(source / "test_wavs" / "0.wav")
+    _write_external_identity(source, "encoder.onnx", "test_wavs/0.wav")
+    np.testing.assert_array_equal(_ort_result(source / "encoder.onnx"), [1])
+    replacement = tmp_path / "replacement.wav"
+    np.full(1, 7, dtype=np.float32).tofile(replacement)
+    assert not pack.package(source, tmp_path / "release", test_wavs_src=replacement)
+    assert not (tmp_path / "release").exists()
+    np.testing.assert_array_equal(_ort_result(source / "encoder.onnx"), [1])
+
+
+@pytest.mark.parametrize("layout", ["inline-step", "external-int64"])
+def test_existing_shared_layout_is_preserved_on_share_and_package(tmp_path, layout):
+    import share_weights as share
+
+    source = _release_input(tmp_path / "source")
+    assert share.share_external_models(source)
+    if layout == "inline-step":
+        _write_model(source, "decoder_step.onnx", weight=np.ones((32, 16), dtype=np.float32))
+    else:
+        canonical = source / "decoder_weights.data"
+        offset = canonical.stat().st_size
+        with canonical.open("ab") as stream:
+            stream.write(np.full(256, 9, dtype=np.int64).tobytes())
+        _write_external_identity(source, "decoder_step.onnx", canonical.name, offset, np.int64)
+    before = {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+    expected = {name: _ort_result(source / name) for name in share._decoder_filenames()}
+    assert share.share_external_models(source)
+    assert {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()} == before
+    output = tmp_path / "release"
+    assert pack.package(source, output)
+    for name, values in expected.items():
+        np.testing.assert_array_equal(_ort_result(output / name), values)

@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -197,6 +198,125 @@ def test_missing_decoder_fails_before_output(tmp_path):
     result = cli(inputs, output)
     assert result.returncode != 0
     assert not output.exists()
+
+
+def _split_output(tmp_path, stem="decoder_init"):
+    inputs, calib = source(tmp_path)
+    if stem != "decoder_init":
+        shutil.copy2(inputs / "decoder_init.onnx", inputs / f"{stem}.onnx")
+    baseline = cli(inputs, inputs, "--decoders", *sorted(path.stem for path in inputs.glob("*.onnx")))
+    assert baseline.returncode == 0, baseline.stdout + baseline.stderr
+    output = tmp_path / "out"
+    first = cli(inputs, output, "--decoders", stem, "--algo", "gptq", "--calib-data", str(calib))
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert (output / f"{stem}.int4.onnx").read_bytes() != (inputs / f"{stem}.int4.onnx").read_bytes()
+    return inputs, output
+
+
+@pytest.mark.parametrize("stem", ["decoder_init", "encoder"])
+def test_split_quantization_keeps_previously_generated_sibling(tmp_path, stem):
+    inputs, output = _split_output(tmp_path, stem)
+    generated = (output / f"{stem}.int4.onnx").read_bytes()
+    second = cli(inputs, output, "--decoders", "decoder_step")
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert (output / f"{stem}.int4.onnx").read_bytes() == generated
+    metadata = json.loads((output / "config.json").read_text())["quantization"]
+    assert metadata[stem] == "int4_gptq_block32"
+    assert metadata["decoder_step"] == "int4_rtn_block32"
+    model = onnx.load(output / f"{stem}.int4.onnx")
+    nodes = [node for node in model.graph.node if node.op_type == "MatMulNBits"]
+    assert len(nodes) == 2
+    assert all(
+        helper.get_attribute_value(next(attribute for attribute in node.attribute if attribute.name == "block_size"))
+        == 32
+        for node in nodes
+    )
+
+
+def _output_bytes(root):
+    return {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+
+def _relocate_split_weights(output, name):
+    from share_weights import external_data_files, model_tensors
+
+    graph = output / "decoder_init.int4.onnx"
+    dependencies = external_data_files(graph)
+    assert len(dependencies) == 1
+    destination = output / name
+    dependencies.pop().rename(destination)
+    model = onnx.load(graph, load_external_data=False)
+    for tensor in model_tensors(model):
+        for entry in tensor.external_data:
+            if entry.key == "location":
+                entry.value = name
+    graph.write_bytes(model.SerializeToString())
+    return graph, destination
+
+
+def test_split_source_closure_cannot_replace_retained_graph(tmp_path):
+    from tests.test_artifact_contract import _write_external_identity
+
+    inputs, output = _split_output(tmp_path)
+    _write_external_identity(inputs, "encoder.onnx", "decoder_init.int4.onnx")
+    before = _output_bytes(output)
+    result = cli(inputs, output, "--decoders", "decoder_step")
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "retained graph" in result.stderr
+    assert _output_bytes(output) == before
+
+
+def test_split_source_copy_cannot_change_retained_weights(tmp_path):
+    inputs, output = _split_output(tmp_path)
+    graph, data = _relocate_split_weights(output, "retained-weights.data")
+    (inputs / data.name).write_bytes(bytes(data.stat().st_size))
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+    expected = ort.InferenceSession(str(graph), options, providers=["CPUExecutionProvider"]).run(
+        None, {"x": np.ones((2, 64), dtype=np.float32)}
+    )[0]
+    before = _output_bytes(output)
+    result = cli(inputs, output, "--decoders", "decoder_step")
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "retained graph" in result.stderr
+    assert _output_bytes(output) == before
+    actual = ort.InferenceSession(str(graph), options, providers=["CPUExecutionProvider"]).run(
+        None, {"x": np.ones((2, 64), dtype=np.float32)}
+    )[0]
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_split_source_identical_retained_weights_are_usable(tmp_path):
+    inputs, output = _split_output(tmp_path)
+    graph, data = _relocate_split_weights(output, "retained-weights.data")
+    shutil.copy2(data, inputs / data.name)
+    before = graph.read_bytes(), data.read_bytes()
+    result = cli(inputs, output, "--decoders", "decoder_step")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (graph.read_bytes(), data.read_bytes()) == before
+
+
+def test_split_generated_graph_cannot_replace_retained_tensor_storage(tmp_path):
+    inputs, output = _split_output(tmp_path)
+    _relocate_split_weights(output, "decoder_step.int4.onnx")
+    before = _output_bytes(output)
+    result = cli(inputs, output, "--decoders", "decoder_step")
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "retained graph" in result.stderr
+    assert _output_bytes(output) == before
+
+
+def test_split_tokenizer_removal_cannot_delete_retained_tensor_storage(tmp_path):
+    from tests.tokenizer_fixtures import save_tokenizer_assets
+
+    inputs, output = _split_output(tmp_path)
+    _relocate_split_weights(output, "chat_template.jinja")
+    save_tokenizer_assets(inputs, template_format="embedded")
+    before = _output_bytes(output)
+    result = cli(inputs, output, "--decoders", "decoder_step")
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "retained graph" in result.stderr
+    assert _output_bytes(output) == before
 
 
 def test_verifies_every_effective_operator_before_saving(tmp_path, monkeypatch):

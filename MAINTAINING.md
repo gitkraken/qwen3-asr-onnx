@@ -78,6 +78,14 @@ sessions; larger models keep the external-data path. Staging can temporarily
 require the source weights' size in additional disk space. Input configuration
 and weights stay untouched on success or failure. This matrix does not change Kepler's own explicit 4-bit recipe.
 
+Split n-bit invocations preserve existing output variants, including arbitrary
+supported model stems, together with their recorded quantization metadata. Before
+quantizing, the command inventories those graphs and their data dependencies and
+checks every generated, copied, rewritten or removed destination. Identical copies
+are omitted; incompatible destinations fail before output mutation, even if the
+source dependency closure reintroduces a previously excluded graph. Use a clean
+output directory when source and retained models require different bytes at one path.
+
 Embedding metadata declares `embed_tokens_shape` and `embed_tokens_dtype`.
 Readers validate dimensions, dtype, byte count and finite values. Legacy exports
 may derive shape from `decoder.vocab_size` and `decoder.hidden_size`; absent dtype
@@ -106,7 +114,10 @@ a successful release cannot leave an ambiguous stale variant beside it. Choose a
 clean output name or move that file aside explicitly before retrying. The shared tokenizer-asset contract
 preserves embedded/JSON/Jinja templates across conversion and archiving, removes
 stale destination template assets when the source has tokenizer assets, and requires a locally renderable ASR prompt
-before a package can be published. An archive or validation failure is a failed
+before a package can be published. Tokenizer assets are validated together in staging,
+and publication exceptions trigger rollback of their previous set. A failed rollback
+reports the preserved backup path. This does not make an entire
+converter invocation transactional. An archive or validation failure is a failed
 command. Standalone archives include the ONNX external-data closure and replace a
 prior tar only after a complete staged write. Tokenizer validation uses built-in
 classes; local asset metadata cannot authorize Python modules. Kepler continues
@@ -126,20 +137,23 @@ Any existing canonical file with incompatible bytes requires an explicit rebuild
 error rather than being overwritten, even when no live graph refers to it.
 Canonical symlink entries are rejected before graph publication.
 
-Successful conventional decoder exports retain the two graph files and canonical
-shared data file. Unreferenced conventional per-decoder data is cleaned on retry after checking
-nested graph references. Sharing stages in a sibling directory so abrupt process
+Successful sharing writes the two graph files and canonical shared data file while
+retaining original data dependencies, including conventional per-decoder files.
+Neither a dependency reference nor a conventional filename proves deletion ownership.
+An exclusive producer stage can remove the inputs it created after publishing the
+canonical outputs; Kepler owns that cleanup and still rejects unexpected leftovers.
+Sharing stages in a sibling directory so abrupt process
 exit cannot contaminate the model inventory or leave directories in the canonical
-triplet handed to Kepler. The model directory must have a writable parent on the
+output handed to Kepler. The model directory must have a writable parent on the
 same filesystem for staging and atomic replacement. A terminated process can leave that sibling behind;
 only remove it after establishing ownership. Historical unmarked staging inside
 a model directory is preserved and inventoried like other foreign content;
-invalid references produce an actionable error before publication. Arbitrary data
-dependencies are retained because a reference does not establish exclusive
-ownership; unreferenced data with custom original names may remain in the working directory;
-keep it until its ownership is known. Packaging includes only the verified file
-closure. Do not remove another graph's data merely because the current pair no
-longer references it. Use Kepler's output lock, stage fingerprints and invalidation
+invalid references produce an actionable error before publication. Keep retained data
+until its ownership is known. Packaging includes only the verified file closure.
+Sharing rejects graph replacement when an independent graph uses that graph file as
+tensor storage. Transport preflight tracks dependency roles even when a file is also
+a selected graph, and reserves optional test-audio destinations before writing.
+Use Kepler's output lock, stage fingerprints and invalidation
 when sharing is called by its pipeline; standalone callers must serialize writes
 to a model directory.
 
@@ -167,9 +181,10 @@ FlashAttention chunk boundaries. Record finite values, shape/token count,
 absolute and relative errors, runtime versions and checkpoint identities.
 
 The validator uses the official native encoder independently of the exported
-wrapper, checks shapes and finite values, enforces the existing absolute 1e-4
+wrapper, checks shapes and finite values, defaults to the existing absolute 1e-4
 encoder threshold directly between native and ONNX as well as both intermediate comparisons, and fails on unacceptable transcript divergence or missing
-sessions. Wrapper-to-ONNX parity remains a separate check. Prompts use the official
+sessions. Explicit CLI tolerance flags select a different finite comparison budget.
+Wrapper-to-ONNX parity remains a separate check. Prompts use the official
 checkpoint chat template and tokenizer for roles, context and forced language.
 Check both original checkpoint tokenizers, including system=8948/user=872 and the
 former IDs' ` Current`/` time` decoding, rather than maintaining role IDs in code.

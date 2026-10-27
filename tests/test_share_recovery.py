@@ -14,7 +14,7 @@ from google.protobuf.message import DecodeError
 from onnx import TensorProto, helper, numpy_helper
 
 import share_weights as share
-from tests.test_artifact_contract import _ort_result, _write_model
+from tests.test_artifact_contract import _ort_result, _write_external_identity, _write_model
 from tests.test_native_decoder import (
     assert_decoder_matches,
     prefill_inputs,
@@ -35,8 +35,9 @@ def _assert_pair(root, expected):
         np.testing.assert_array_equal(_ort_result(root / name), values)
 
 
-def _assert_clean(root):
-    assert {path.name for path in root.iterdir()} == {"decoder_init.onnx", "decoder_step.onnx", "decoder_weights.data"}
+def _assert_shared(root):
+    assert {"decoder_init.onnx", "decoder_step.onnx", "decoder_weights.data"} <= {path.name for path in root.iterdir()}
+    assert all(path.is_file() for path in root.iterdir())
 
 
 def test_interruption_after_data_publication_is_recoverable(tmp_path, monkeypatch):
@@ -60,7 +61,7 @@ def test_interruption_after_data_publication_is_recoverable(tmp_path, monkeypatc
     _assert_pair(tmp_path, expected)
     assert share.share_external_models(tmp_path)
     _assert_pair(tmp_path, expected)
-    _assert_clean(tmp_path)
+    _assert_shared(tmp_path)
 
 
 @pytest.mark.parametrize("inline", [False, True])
@@ -100,7 +101,7 @@ def test_partial_proto_write_keeps_original_pair_usable(tmp_path, monkeypatch, i
     _assert_pair(tmp_path, expected)
     assert share.share_external_models(tmp_path)
     _assert_pair(tmp_path, expected)
-    _assert_clean(tmp_path)
+    _assert_shared(tmp_path)
 
 
 @pytest.mark.parametrize("inline", [False, True])
@@ -122,11 +123,12 @@ def test_interruption_after_graph_replace_can_retry(tmp_path, monkeypatch, inlin
     _assert_pair(tmp_path, expected)
     assert share.share_external_models(tmp_path)
     _assert_pair(tmp_path, expected)
-    _assert_clean(tmp_path)
+    _assert_shared(tmp_path)
 
 
-def test_cleanup_failure_keeps_models_usable_and_retry_cleans(tmp_path, monkeypatch):
+def test_sharing_retains_original_data_without_unlinking(tmp_path, monkeypatch):
     expected = _pair(tmp_path)
+    retained = {p.name: p.read_bytes() for p in tmp_path.glob("*.onnx.data")}
     original_unlink = share.os.unlink
 
     def injected(path, *args, **kwargs):
@@ -136,11 +138,11 @@ def test_cleanup_failure_keeps_models_usable_and_retry_cleans(tmp_path, monkeypa
 
     with monkeypatch.context() as patch:
         patch.setattr(share.os, "unlink", injected)
-        with pytest.raises(OSError, match="cleanup"):
-            share.share_external_models(tmp_path)
+        assert share.share_external_models(tmp_path)
     _assert_pair(tmp_path, expected)
     assert share.share_external_models(tmp_path)
-    _assert_clean(tmp_path)
+    _assert_shared(tmp_path)
+    assert {p.name: p.read_bytes() for p in tmp_path.glob("*.onnx.data")} == retained
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float16])
@@ -158,7 +160,7 @@ def test_sharing_preserves_unmatched_tensors_and_storage_contract(tmp_path, dtyp
         assert actual.shape == weight.shape
         assert actual.tobytes() == weight.tobytes()
     _assert_pair(tmp_path, expected)
-    _assert_clean(tmp_path)
+    _assert_shared(tmp_path)
     before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
     assert share.share_external_models(tmp_path)
     assert before == {p.name: p.read_bytes() for p in tmp_path.iterdir()}
@@ -249,7 +251,7 @@ def test_shared_native_decoder_preserves_prefill_and_step(tmp_path, decoder_expo
     assert share.share_external_models(tmp_path)
     assert_decoder_matches(_run_model(tmp_path / "decoder_init.onnx", prefill_feed), before)
     assert_decoder_matches(_run_model(tmp_path / "decoder_step.onnx", step_feed), before_step)
-    _assert_clean(tmp_path)
+    _assert_shared(tmp_path)
 
 
 @pytest.mark.parametrize("kind", ["Constant", "ConstantOfShape", "Split"])
@@ -351,21 +353,47 @@ def test_conflicting_canonical_data_is_preserved(tmp_path, inline):
     _assert_pair(tmp_path, expected)
 
 
-def test_identical_canonical_symlink_rejected_before_graph_publication(tmp_path):
-    expected = _pair(tmp_path)
+@pytest.mark.parametrize("kind,suffix", [("symlink", None), ("hardlink", None), ("hardlink", "q4f16")])
+def test_linked_canonical_data_rejected_before_graph_publication(tmp_path, kind, suffix):
     reference = tmp_path / "reference"
     reference.mkdir()
-    _pair(reference)
-    assert share.share_external_models(reference)
+    names = share._decoder_filenames(suffix)
+    for root in (tmp_path, reference):
+        for name in names:
+            _write_model(root, name, external=True)
+    expected = {name: _ort_result(tmp_path / name) for name in names}
+    canonical_name = share._shared_data_name(suffix)
+    assert share.share_external_models(reference, suffix=suffix)
     retained = tmp_path / "retained.bin"
-    retained.write_bytes((reference / "decoder_weights.data").read_bytes())
+    retained.write_bytes((reference / canonical_name).read_bytes())
     shutil.rmtree(reference)
-    (tmp_path / "decoder_weights.data").symlink_to(retained)
+    canonical = tmp_path / canonical_name
+    if kind == "symlink":
+        canonical.symlink_to(retained)
+    else:
+        os.link(retained, canonical)
     before = {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()}
-    with pytest.raises(ValueError):
-        share.share_external_models(tmp_path)
+    with pytest.raises(Exception) as caught:
+        share.share_external_models(tmp_path, suffix=suffix)
     assert {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()} == before
+    assert isinstance(caught.value, ValueError)
+    assert canonical.is_symlink() == (kind == "symlink")
+    assert canonical.stat().st_ino == retained.stat().st_ino
     _assert_pair(tmp_path, expected)
+    for name in names:
+        onnx.checker.check_model(str(tmp_path / name))
+
+
+def test_sharing_keeps_an_explicit_model_directory_alias(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    expected = _pair(model)
+    alias = tmp_path / "model-alias"
+    alias.symlink_to(model, target_is_directory=True)
+    assert share.share_external_models(alias)
+    _assert_pair(model, expected)
+    for name in expected:
+        onnx.checker.check_model(str(model / name))
 
 
 def test_small_inline_pair_rejects_foreign_canonical_data(tmp_path):
@@ -390,6 +418,7 @@ def test_atomic_json_writer_removes_staging_after_serialization_failure(tmp_path
 @pytest.mark.parametrize("already_shared", [False, True])
 def test_unrelated_invalid_graph_rejected_before_decoder_publication(tmp_path, auxiliary, already_shared):
     expected = _pair(tmp_path)
+    retained = {p.name: p.read_bytes() for p in tmp_path.glob("*.onnx.data")}
     if already_shared:
         assert share.share_external_models(tmp_path)
     graph = tmp_path / auxiliary
@@ -406,7 +435,7 @@ def test_unrelated_invalid_graph_rejected_before_decoder_publication(tmp_path, a
     graph.unlink()
     assert share.share_external_models(tmp_path)
     _assert_pair(tmp_path, expected)
-    assert not list(tmp_path.glob("*.onnx.data"))
+    assert {p.name: p.read_bytes() for p in tmp_path.glob("*.onnx.data")} == retained
 
 
 ROOT = Path(share.__file__).resolve().parent
@@ -414,12 +443,13 @@ ROOT = Path(share.__file__).resolve().parent
 
 @pytest.mark.parametrize("suffix", [None, "int4", "q4f16"])
 @pytest.mark.parametrize("foreign", [False, True])
-def test_abrupt_exit_retry_preserves_models_and_stage_contract(tmp_path, suffix, foreign):
+def test_abrupt_exit_retry_preserves_models_and_source_data(tmp_path, suffix, foreign):
     model = tmp_path / "models"
     model.mkdir()
     names = share._decoder_filenames(suffix)
     for name in names:
         _write_model(model, name, external=True)
+    original_data = {p.name: p.read_bytes() for p in model.glob("*.onnx.data")}
     expected = {name: _ort_result(model / name) for name in names}
     retained = {}
     if foreign:
@@ -469,12 +499,12 @@ s.share_external_models(sys.argv[1], suffix=sys.argv[2] or None)
         _ort_result(model / ".share-foreign" / "aux.onnx")
     else:
         selected = {*names, share._shared_data_name(suffix)}
-        assert {p.name for p in model.iterdir()} == selected
+        assert {p.name for p in model.iterdir()} == selected | set(original_data)
         copied = tmp_path / "copied"
         copied.mkdir()
         for name in selected:
             shutil.move(model / name, copied / name)
-        assert list(model.iterdir()) == []
+        assert {p.name: p.read_bytes() for p in model.iterdir()} == original_data
         for name, values in expected.items():
             np.testing.assert_array_equal(_ort_result(copied / name), values)
 
@@ -510,3 +540,28 @@ def test_parent_traversal_is_rejected_before_mkdir(tmp_path):
     with pytest.raises(ValueError, match="escapes"):
         share.copy_artifact_entry(tmp_path, output, "../outside/new/file")
     assert list(tmp_path.iterdir()) == []
+
+
+def test_sharing_retains_unreferenced_conventional_data(tmp_path):
+    expected = _pair(tmp_path, inline=True)
+    retained = {name + ".data": b"unrelated retained bytes" for name in share._decoder_filenames()}
+    for name, data in retained.items():
+        (tmp_path / name).write_bytes(data)
+    assert share.share_external_models(tmp_path)
+    assert share.share_external_models(tmp_path)
+    _assert_pair(tmp_path, expected)
+    for name, data in retained.items():
+        assert (tmp_path / name).read_bytes() == data
+
+
+def test_sharing_protects_independent_graph_storage(tmp_path):
+    _pair(tmp_path, inline=True)
+    data = (tmp_path / "decoder_init.onnx").read_bytes()
+    offset = data.index(np.arange(512, dtype=np.float32).tobytes())
+    _write_external_identity(tmp_path, "encoder.onnx", "decoder_init.onnx", offset)
+    np.testing.assert_array_equal(_ort_result(tmp_path / "encoder.onnx"), [0])
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    with pytest.raises(ValueError, match="destination conflict"):
+        share.share_external_models(tmp_path)
+    assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before
+    np.testing.assert_array_equal(_ort_result(tmp_path / "encoder.onnx"), [0])

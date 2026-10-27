@@ -54,6 +54,7 @@ from share_weights import (
     external_data_files,
     get_external_info,
     model_tensors,
+    protect_retained_graphs,
     transport_graph_files,
     validate_generated_destinations,
     write_artifact_json,
@@ -265,18 +266,35 @@ def main():
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Required decoder not found: {path}")
 
-    if tokenizer_asset_names(args.input):
+    tokenizer_files = tokenizer_asset_names(args.input)
+    if tokenizer_files:
         validate_tokenizer_assets(args.input)
 
     bits_suffix = f".int{args.bits}"
+    generated_graphs = {f"{name}{bits_suffix}.onnx" for name in args.decoders}
+    retained_graphs = {
+        path.name for path in Path(args.output).glob(f"*{bits_suffix}.onnx") if path.is_file()
+    } - generated_graphs
+    excluded_graphs = (
+        generated_graphs | retained_graphs | {f"{name}{bits_suffix}.onnx" for name in ("decoder_init", "decoder_step")}
+    )
+    excluded_files = excluded_graphs | {f"{name}.data" for name in excluded_graphs}
+    previous_quantization = {}
+    prior_config = Path(args.output) / "config.json"
+    if prior_config.is_file():
+        prior = json.loads(prior_config.read_text())
+        prior_quantization = prior.get("quantization", {})
+        if isinstance(prior_quantization, dict):
+            previous_quantization = {
+                name: tag for name, tag in prior_quantization.items() if f"{name}{bits_suffix}.onnx" in retained_graphs
+            }
     files = {
         fname
         for fname in os.listdir(args.input)
         if fname not in TOKENIZER_FILES
-        and not any(fname.startswith(f"{name}{bits_suffix}") for name in args.decoders)
+        and fname not in excluded_files
         and os.path.isfile(os.path.join(args.input, fname))
     }
-    generated_graphs = {f"{name}{bits_suffix}.onnx" for name in args.decoders}
     generated = generated_graphs | {f"{name}.data" for name in generated_graphs}
     files.update(
         transport_graph_files(
@@ -284,6 +302,15 @@ def main():
         )
     )
     files.difference_update(TOKENIZER_FILES)
+    files = protect_retained_graphs(
+        args.input,
+        args.output,
+        retained_graphs,
+        files,
+        generated=generated,
+        rewritten={"config.json", *tokenizer_files},
+        removed=TOKENIZER_FILES - tokenizer_files if tokenizer_files else (),
+    )
     validate_generated_destinations(args.output, generated)
     os.makedirs(args.output, exist_ok=True)
 
@@ -304,7 +331,7 @@ def main():
             copy_artifact_entry(args.input, args.output, fname)
             print(f"  Copied {fname}")
 
-    if tokenizer_asset_names(args.input):
+    if tokenizer_files:
         copy_tokenizer_assets(args.input, args.output)
 
     # Update config.json quantization field (merge with existing for split-decoder runs)
@@ -318,6 +345,9 @@ def main():
         quant_info = cfg.get("quantization", {})
         if isinstance(quant_info, str):
             quant_info = {}  # migrate from old scalar format
+        for graph in retained_graphs:
+            quant_info.pop(graph.removesuffix(f"{bits_suffix}.onnx"), None)
+        quant_info.update(previous_quantization)
         for name in quantized_names:
             quant_info[name] = tag
         cfg["quantization"] = quant_info

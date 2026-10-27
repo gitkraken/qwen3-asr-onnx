@@ -1,9 +1,9 @@
-import os
 import shutil
 import tempfile
 from pathlib import Path
 
 from src import prompt
+from src.artifact_publication import publish_artifacts
 
 TOKENIZER_FILES = frozenset(
     {
@@ -76,13 +76,16 @@ def copy_tokenizer_assets(source, target) -> None:
         return
     names = tokenizer_asset_names(source)
     target.mkdir(parents=True, exist_ok=True)
+    for name in TOKENIZER_FILES:
+        if (target / name).is_dir():
+            raise ValueError(f"Tokenizer asset destination is a directory: {target / name}")
     # Existing metadata may link to a retained release; never write through those links.
     with tempfile.TemporaryDirectory(prefix=".tokenizer-", dir=target) as temp:
         stage = Path(temp)
         for name in sorted(names):
             shutil.copy2(source / name, stage / name)
-        for name in sorted(TOKENIZER_FILES - names):
-            (target / name).unlink(missing_ok=True)
-        for name in sorted(names):
-            os.replace(stage / name, target / name)
-    validate_tokenizer_assets(target)
+        validate_tokenizer_assets(stage)
+        publish_artifacts(
+            [(stage / name, target / name) for name in sorted(names)],
+            [target / name for name in sorted(TOKENIZER_FILES - names)],
+        )

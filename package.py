@@ -14,6 +14,7 @@ import onnxruntime as ort
 
 from share_weights import graph_file_closure, share_external_models, transport_graph_files
 from src.artifact_metadata import MODEL_METADATA_FILES
+from src.artifact_publication import publish_artifacts
 from src.embeddings import load_embed_tokens
 from src.tokenizer_assets import tokenizer_asset_names, validate_tokenizer_assets
 
@@ -95,40 +96,6 @@ def _validate_archive_target(target, archive_root, variant):
         raise ValueError(f"Unrecognized archive destination {target}; preserve it or choose another output") from error
 
 
-def _publish_artifacts(replacements):
-    backup = Path(tempfile.mkdtemp(prefix=".release-backup-", dir=replacements[0][1].parent))
-    saved = []
-    installed = []
-    clean = False
-    try:
-        for index, (source, target) in enumerate(replacements):
-            if target.exists():
-                old = backup / str(index)
-                os.replace(target, old)
-                saved.append((old, target))
-            os.replace(source, target)
-            installed.append(target)
-        clean = True
-    except BaseException:
-        try:
-            for target in reversed(installed):
-                if target.is_dir():
-                    shutil.rmtree(target)
-                else:
-                    target.unlink()
-            for old, target in reversed(saved):
-                os.replace(old, target)
-            clean = True
-        except Exception as recovery_error:
-            raise RuntimeError(
-                f"Publication rollback failed; previous artifacts remain in {backup}"
-            ) from recovery_error
-        raise
-    finally:
-        if clean:
-            shutil.rmtree(backup)
-
-
 def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
     source = Path(input_dir).resolve()
     output = Path(output_dir).absolute()
@@ -173,10 +140,14 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
         if not (candidate == embed).all():
             raise ValueError("FP16 embedding sidecar disagrees with canonical data")
         embed = candidate
+    rewritten = {"config.json", "embed_tokens.bin"}
+    rewritten.update(name for variant in variants for name in _graph_names(variant)[1:])
+    if test_wavs_src is not None:
+        rewritten.add("test_wavs/0.wav")
     graph_files = transport_graph_files(
         source,
         (name for variant in variants for name in _graph_names(variant)),
-        rewritten={"config.json", "embed_tokens.bin"},
+        rewritten=rewritten,
     )
     for variant in variants:
         canonical = f"decoder_weights.{variant}.data" if variant else "decoder_weights.data"
@@ -223,7 +194,7 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
             members = shared | variant_files[variant]
             _create_archive(release, archive_path, members, base)
             replacements.append((archive_path, archives[variant]))
-        _publish_artifacts(replacements)
+        publish_artifacts(replacements)
     print(f"Release directory: {output}")
     return True
 
