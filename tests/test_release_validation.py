@@ -1,13 +1,17 @@
 import json
+import os
 import sys
 import tarfile
+import tempfile
+import uuid
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 import create_tar
 from src.release_validation import graph_names, validate_release
-from tests.test_artifact_contract import _release_input, _write_model
+from tests.test_artifact_contract import _ort_result, _release_input, _write_external_identity, _write_model
 
 
 def _archive(source):
@@ -112,3 +116,152 @@ def test_archive_destination_cannot_replace_graph_storage(tmp_path):
     assert create_tar.create_tar(_archive(source), source) is None
     assert (source / "model.tar.gz").read_bytes() == original
     validate_release(source, graph_names())
+
+
+@pytest.mark.parametrize("directory_alias", [False, True])
+def test_archive_container_ignores_unrelated_broken_models(tmp_path, directory_alias):
+    source = _release_input(tmp_path / "source")
+    output = tmp_path / "archives"
+    output.mkdir()
+    foreign = output / "unrelated"
+    foreign.mkdir()
+    _write_model(foreign, "unrelated.onnx", external=True)
+    (foreign / "unrelated.onnx.data").unlink()
+    previous = (foreign / "unrelated.onnx").read_bytes()
+    if directory_alias:
+        alias = tmp_path / "archive-alias"
+        alias.symlink_to(output, target_is_directory=True)
+        output = alias
+    path = create_tar.create_tar(_archive(source), output)
+    assert path is not None
+    with tarfile.open(path) as archive:
+        members = {item.name.removeprefix("model/") for item in archive.getmembers()}
+    assert members == validate_release(source, graph_names())
+    assert (foreign / "unrelated.onnx").read_bytes() == previous
+    assert not (foreign / "unrelated.onnx.data").exists()
+
+
+def test_archive_cli_default_temporary_directory(tmp_path, monkeypatch):
+    source = _release_input(tmp_path / "source")
+    archive = _archive(source) | {"name": f"kepler-test-{uuid.uuid4().hex}"}
+    target = Path("/tmp") / f"{archive['name']}.tar.gz"
+    assert not target.exists() and not target.is_symlink()
+    monkeypatch.setattr(create_tar, "ARCHIVES", [archive])
+    monkeypatch.setattr(sys, "argv", ["create_tar.py", "--dry-run"])
+    try:
+        with tempfile.TemporaryDirectory(prefix="kepler-foreign-", dir="/tmp") as directory:
+            foreign = Path(directory)
+            _write_model(foreign, "unrelated.onnx", external=True)
+            (foreign / "unrelated.onnx.data").unlink()
+            previous = (foreign / "unrelated.onnx").read_bytes()
+            assert create_tar.main() == 0
+            with tarfile.open(target) as stored:
+                assert f"{archive['name']}/encoder.onnx" in stored.getnames()
+            assert (foreign / "unrelated.onnx").read_bytes() == previous
+    finally:
+        target.unlink(missing_ok=True)
+
+
+def test_archive_preserves_physical_source_metadata_alias(tmp_path):
+    source = _release_input(tmp_path / "source")
+    output = tmp_path / "archives"
+    output.mkdir()
+    target = output / "model.tar.gz"
+    target.write_text("{}")
+    metadata = source / "preprocessor_config.json"
+    metadata.unlink()
+    metadata.symlink_to(target)
+    assert create_tar.create_tar(_archive(source), output) is None
+    assert target.read_text() == "{}"
+    validate_release(source, graph_names())
+
+
+@pytest.mark.parametrize("nested_output", [False, True])
+def test_archive_preserves_unselected_source_graph_storage(tmp_path, nested_output):
+    source = _release_input(tmp_path / "source")
+    output = source / "archives" if nested_output else source
+    output.mkdir(exist_ok=True)
+    relative = "archives/model.tar.gz" if nested_output else "model.tar.gz"
+    target = source / relative
+    target.write_bytes(np.array([42], np.float32).tobytes())
+    _write_external_identity(source, "aux.onnx", relative)
+    assert create_tar.create_tar(_archive(source), output) is None
+    np.testing.assert_array_equal(_ort_result(source / "aux.onnx"), [42])
+    assert target.read_bytes() == np.array([42], np.float32).tobytes()
+
+
+@pytest.mark.parametrize("kind", ["directory", "symlink", "dangling", "hardlink"])
+def test_archive_refuses_nonregular_or_linked_output_leaf(tmp_path, kind):
+    source = _release_input(tmp_path / "source")
+    output = tmp_path / "archives"
+    output.mkdir()
+    target = output / "model.tar.gz"
+    retained = tmp_path / "retained"
+    retained.write_bytes(b"retained bytes")
+    if kind == "directory":
+        target.mkdir()
+        (target / "sentinel").write_bytes(b"directory bytes")
+    elif kind == "symlink":
+        target.symlink_to(retained)
+    elif kind == "dangling":
+        target.symlink_to(tmp_path / "missing")
+    else:
+        os.link(retained, target)
+    assert create_tar.create_tar(_archive(source), output) is None
+    assert retained.read_bytes() == b"retained bytes"
+    if kind == "directory":
+        assert (target / "sentinel").read_bytes() == b"directory bytes"
+    elif kind in {"symlink", "dangling"}:
+        assert target.is_symlink()
+
+
+@pytest.mark.parametrize("name", ["", ".", "..", "../escape", "/absolute", "nested/name", "nested\\name"])
+def test_archive_requires_a_safe_member_root_and_leaf(tmp_path, name):
+    source = _release_input(tmp_path / "source")
+    output = tmp_path / "archives"
+    output.mkdir()
+    assert create_tar.create_tar(_archive(source) | {"name": name}, output) is None
+    assert list(output.iterdir()) == []
+
+
+@pytest.mark.parametrize("kind", ["metadata", "unselected-graph"])
+def test_archive_source_identity_uses_filesystem_case_semantics(tmp_path, kind):
+    source = _release_input(tmp_path / "source")
+    output = source / "archives" if kind == "unselected-graph" else tmp_path / "archives"
+    output.mkdir()
+    existing = output / "MODEL.tar.gz"
+    target = output / "model.tar.gz"
+    if kind == "metadata":
+        existing.write_text("{}")
+        metadata = source / "preprocessor_config.json"
+        metadata.unlink()
+        metadata.symlink_to(existing)
+    else:
+        existing.write_bytes(np.array([42], np.float32).tobytes())
+        _write_external_identity(source, "aux.onnx", "archives/MODEL.tar.gz")
+    previous = existing.read_bytes()
+    aliases_source = target.exists() and target.samefile(existing)
+    result = create_tar.create_tar(_archive(source), output)
+    if aliases_source:
+        assert result is None
+    else:
+        assert result is not None
+        with tarfile.open(result) as stored:
+            assert "model/encoder.onnx" in stored.getnames()
+    assert existing.read_bytes() == previous
+    validate_release(source, graph_names())
+    if kind == "unselected-graph":
+        np.testing.assert_array_equal(_ort_result(source / "aux.onnx"), [42])
+
+
+def test_archive_can_replace_an_unrelated_regular_output(tmp_path):
+    source = _release_input(tmp_path / "source")
+    output = tmp_path / "archives"
+    output.mkdir()
+    target = output / "model.tar.gz"
+    target.write_bytes(b"previous archive")
+    before = {path.name: path.read_bytes() for path in source.iterdir() if path.is_file()}
+    assert create_tar.create_tar(_archive(source), output) == str(target)
+    with tarfile.open(target) as stored:
+        assert "model/encoder.onnx" in stored.getnames()
+    assert {path.name: path.read_bytes() for path in source.iterdir() if path.is_file()} == before

@@ -13,11 +13,12 @@ Usage:
 import argparse
 import os
 import tarfile
+from pathlib import Path
 
 from huggingface_hub import HfApi
 
 from src.artifact_publication import ArtifactStaging
-from src.onnx_artifacts import preflight_artifact_mutations
+from src.onnx_artifacts import inventory_graphs, validate_generated_destinations
 from src.release_validation import validate_release
 
 # Archives are built from release/ dirs (produced by package.py), which contain
@@ -66,24 +67,40 @@ ARCHIVES = [
 ]
 
 
+def _archive_destination(source, output, name, members):
+    if not isinstance(name, str) or not name or name in {".", ".."} or Path(name).name != name or "\\" in name:
+        raise ValueError("Archive name must be a single safe path component")
+    source, output = Path(source).resolve(), Path(output).resolve()
+    filename = f"{name}.tar.gz"
+    validate_generated_destinations(output, [filename])
+    target = output / filename
+    graphs = inventory_graphs(source)
+    protected_names = set(members) | graphs.keys() | {name for names in graphs.values() for name in names}
+    protected = {source / name for name in protected_names}
+    if target in protected | {path.resolve() for path in protected} or (
+        target.exists() and any(target.samefile(path) for path in protected)
+    ):
+        raise ValueError(f"Archive destination would replace a source artifact: {target}")
+    return target
+
+
 def create_tar(archive, output_dir):
     name = archive["name"]
-    source_dir = archive["source_dir"]
+    source_dir = Path(archive["source_dir"]).resolve()
     graphs = {filename for filename in archive["files"] if filename.endswith(".onnx")}
-    tar_path = os.path.join(output_dir, f"{name}.tar.gz")
     try:
         all_files = validate_release(source_dir, graphs)
-        preflight_artifact_mutations(source_dir, output_dir, (), generated={f"{name}.tar.gz"}, reads=graphs)
+        tar_path = _archive_destination(source_dir, output_dir, name, all_files)
     except Exception as error:
         print(f"  ERROR: Invalid release: {error}")
         return None
     print(f"  Creating {tar_path}...")
     try:
-        with ArtifactStaging(prefix=".archive-", dir=output_dir) as staging:
-            staged_tar = os.path.join(staging.path, f"{name}.tar.gz")
+        with ArtifactStaging(prefix=".archive-", dir=tar_path.parent) as staging:
+            staged_tar = staging.path / tar_path.name
             with tarfile.open(staged_tar, "w:gz", compresslevel=1, dereference=True) as target:
                 for filename in sorted(all_files):
-                    target.add(os.path.join(source_dir, filename), arcname=f"{name}/{filename}", recursive=False)
+                    target.add(source_dir / filename, arcname=f"{name}/{filename}", recursive=False)
             os.replace(staged_tar, tar_path)
             staging.mark_complete()
     except (OSError, tarfile.TarError) as error:
@@ -92,7 +109,7 @@ def create_tar(archive, output_dir):
 
     size = os.path.getsize(tar_path)
     print(f"  Size: {size / 1e6:.1f} MB ({size / 1e9:.2f} GB)")
-    return tar_path
+    return str(tar_path)
 
 
 def upload_tar(tar_path, repo, filename):
