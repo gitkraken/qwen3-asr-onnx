@@ -142,8 +142,12 @@ def _converter_command(tmp_path, script, source, target):
     if script == "quantize_static.py":
         cache = tmp_path / "cache"
         cache.mkdir()
-        inputs = np.array([{"x": np.ones((1, 4), dtype=np.float32)}], dtype=object)
-        np.savez(cache / "calib_n1_s1.npz", init_inputs=inputs, step_inputs=inputs)
+        from quantize_static import calibration_identity
+        from src.calibration_cache import cache_key, pack_samples, save_cache
+
+        identity = calibration_identity(source, 1, 1)
+        inputs = [{"x": np.ones((1, 4), dtype=np.float32)}]
+        save_cache(cache / f"calib_{cache_key(identity)}.npz", identity, pack_samples({"init": inputs, "step": inputs}))
         command += ["--cache-dir", str(cache), "--n-samples", "1", "--n-steps", "1"]
     return command
 

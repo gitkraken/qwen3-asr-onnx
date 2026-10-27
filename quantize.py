@@ -23,8 +23,10 @@ from onnxruntime.quantization import QuantType, quantize_dynamic
 
 from src.onnx_artifacts import (
     copy_artifact_entry,
+    external_data_files,
     isolated_onnx_input,
     preflight_artifact_mutations,
+    retained_quantization,
     write_artifact_json,
 )
 from src.tokenizer_assets import (
@@ -147,18 +149,7 @@ def main():
         if os.path.isfile(os.path.join(args.input, name))
     }
     generated = generated_graphs | {f"{name}.data" for name in generated_graphs}
-    retained_graphs = {
-        path.name for path in Path(args.output).glob(f"*{suffix}.onnx") if path.is_file()
-    } - generated_graphs
-    previous_quantization = {}
-    prior_config = Path(args.output) / "config.json"
-    if prior_config.is_file():
-        prior = json.loads(prior_config.read_text())
-        prior_quantization = prior.get("quantization", {})
-        if isinstance(prior_quantization, dict):
-            previous_quantization = {
-                name: tag for name, tag in prior_quantization.items() if f"{name}{suffix}.onnx" in retained_graphs
-            }
+    retained_graphs, previous_quantization = retained_quantization(args.output, suffix, generated_graphs)
     files.discard("config.json")
     tokenizer_files = tokenizer_asset_names(args.input)
     files = preflight_artifact_mutations(
@@ -208,25 +199,21 @@ def main():
             nodes_to_exclude=file_exclude,
         )
 
-    # Embed encoder weights into the INT8 .onnx proto (eliminates .data file)
     encoder_out = os.path.join(args.output, f"encoder{suffix}.onnx")
-    encoder_data = encoder_out + ".data"
-    if f"encoder{suffix}.onnx" in generated_graphs and os.path.exists(encoder_data):
+    if f"encoder{suffix}.onnx" in generated_graphs and external_data_files(encoder_out):
         print("  Embedding INT8 encoder weights into .onnx proto...")
         enc = onnx.load(encoder_out, load_external_data=True)
         onnx.save(enc, encoder_out)
-        os.remove(encoder_data)
 
     # Inline quantized decoder_step weights into .onnx proto if under 2 GB.
     step_out = os.path.join(args.output, f"decoder_step{suffix}.onnx")
-    step_data = step_out + ".data"
-    if f"decoder_step{suffix}.onnx" in generated_graphs and os.path.exists(step_data):
-        step_size = os.path.getsize(step_data)
+    step_data = external_data_files(step_out) if f"decoder_step{suffix}.onnx" in generated_graphs else set()
+    if step_data:
+        step_size = sum(path.stat().st_size for path in step_data)
         if step_size < 1.8e9:  # safe margin under 2 GB protobuf limit
             print("\nInlining INT8 decoder_step weights into .onnx proto...")
             step_model = onnx.load(step_out, load_external_data=True)
             onnx.save(step_model, step_out)
-            os.remove(step_data)
             print(f"  {os.path.basename(step_out)}: {os.path.getsize(step_out) / 1e6:.1f} MB (self-contained)")
 
     # Copy non-quantized files (skip if input == output)

@@ -113,6 +113,21 @@ def inventory_graphs(root, exclude=()):
     return graphs
 
 
+def retained_quantization(output, suffix, generated, *, existing=None):
+    graphs = inventory_graphs(output, generated) if existing is None else existing
+    retained = {name for name in graphs if name.endswith(f"{suffix}.onnx")} - set(generated)
+    config = Path(output) / "config.json"
+    if not config.is_file():
+        return retained, {}
+    previous = json.loads(config.read_text()).get("quantization", {})
+    tags = (
+        {name: tag for name, tag in previous.items() if f"{name}{suffix}.onnx" in retained}
+        if isinstance(previous, dict)
+        else {}
+    )
+    return retained, tags
+
+
 def preflight_artifact_mutations(
     source, output, copies, *, generated=(), rewritten=(), removed=(), reads=(), existing=None, copied_assets=()
 ):

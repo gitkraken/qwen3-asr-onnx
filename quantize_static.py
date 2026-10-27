@@ -25,6 +25,7 @@ import io
 import json
 import os
 import time
+from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
@@ -40,8 +41,18 @@ from onnxruntime.quantization import (
 
 from share_weights import share_external_models
 from src.artifact_metadata import MODEL_METADATA_FILES
+from src.calibration_cache import (
+    cache_key,
+    file_fingerprints,
+    load_cache,
+    pack_samples,
+    recipe,
+    save_cache,
+    unpack_samples,
+)
 from src.onnx_artifacts import (
     copy_artifact_entry,
+    graph_file_closure,
     isolated_onnx_input,
     preflight_artifact_mutations,
     write_artifact_json,
@@ -276,6 +287,16 @@ def quantize_decoder(
 # ---------------------------------------------------------------------------
 
 
+def calibration_identity(model_dir, n_samples, n_steps):
+    root = Path(model_dir)
+    graphs = {name for name in ("encoder.onnx", "decoder_init.onnx", "decoder_step.onnx") if (root / name).is_file()}
+    names = graph_file_closure(root, graphs) | tokenizer_asset_names(root)
+    names.update(name for name in (*MODEL_METADATA_FILES, "embed_tokens.bin") if (root / name).is_file())
+    return recipe(
+        "static", file_fingerprints(root, names), {"n_samples": n_samples, "n_steps": n_steps}, Path(__file__)
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Static INT8 quantization for Qwen3-ASR decoder")
     parser.add_argument(
@@ -334,7 +355,7 @@ def main():
         "--cache-dir",
         type=str,
         default=None,
-        help="Directory to cache/load calibration data (.npz)",
+        help="Directory for provenance-checked numeric calibration caches (.npz)",
     )
     args = parser.parse_args()
     if tokenizer_asset_names(args.input):
@@ -384,35 +405,23 @@ def main():
     if args.nodes_to_exclude:
         exclude_nodes = [n.strip() for n in args.nodes_to_exclude.split(",")]
 
-    # Collect or load calibration data
     cache_path = None
+    identity = None
+    cached = None
     if args.cache_dir:
-        os.makedirs(args.cache_dir, exist_ok=True)
-        cache_path = os.path.join(args.cache_dir, f"calib_n{args.n_samples}_s{args.n_steps}.npz")
-
-    if cache_path and os.path.exists(cache_path):
-        print(f"Loading cached calibration data from {cache_path}...")
-        data = np.load(cache_path, allow_pickle=True)
-        init_inputs = list(data["init_inputs"])
-        step_inputs = list(data["step_inputs"])
-        print(f"  Loaded {len(init_inputs)} init, {len(step_inputs)} step inputs")
+        identity = calibration_identity(args.input, args.n_samples, args.n_steps)
+        cache_path = Path(args.cache_dir) / f"calib_{cache_key(identity)}.npz"
+        cached = load_cache(cache_path, identity)
+    if cached is not None:
+        groups = unpack_samples(cached, ("init", "step"))
+        init_inputs, step_inputs = groups["init"], groups["step"]
+        print(f"Loaded {len(init_inputs)} init and {len(step_inputs)} step samples from {cache_path}")
     else:
         t0 = time.time()
-        init_inputs, step_inputs = collect_calibration_data(
-            args.input,
-            n_samples=args.n_samples,
-            n_steps=args.n_steps,
-        )
-        elapsed = time.time() - t0
-        print(f"  Calibration data collected in {elapsed:.1f}s")
-
-        if cache_path:
-            np.savez(
-                cache_path,
-                init_inputs=np.array(init_inputs, dtype=object),
-                step_inputs=np.array(step_inputs, dtype=object),
-            )
-            print(f"  Cached to {cache_path}")
+        init_inputs, step_inputs = collect_calibration_data(args.input, n_samples=args.n_samples, n_steps=args.n_steps)
+        print(f"Calibration data collected in {time.time() - t0:.1f}s")
+        if cache_path is not None:
+            save_cache(cache_path, identity, pack_samples({"init": init_inputs, "step": step_inputs}))
 
     # Quantize decoder_init
     init_path = os.path.join(args.input, "decoder_init.onnx")

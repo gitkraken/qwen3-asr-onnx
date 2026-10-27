@@ -163,6 +163,26 @@ returning, so calibration and evaluation inherit the same prompt contract. Famil
 validation additionally checks every shipped template representation. Kepler continues
 using its own manifest-driven publisher.
 
+## Calibration cache provenance
+
+Static calibration and AWQ use numeric NPZ caches with one versioned provenance
+record and no object deserialization. Static identity includes the actual ONNX
+and external-data bytes, embeddings, tokenizer files and collection parameters.
+AWQ hashes the loaded checkpoint tensors in bounded chunks, model configuration,
+selected tokenizer/template and collection parameters before smoothing. Both
+record the producing code and relevant dependency versions.
+
+Default cache filenames include that identity. Legacy caches remain untouched;
+an upgrade collects a new entry, and only a matching entry is reused. An explicit
+AWQ cache path with absent or incompatible provenance fails without replacing it;
+choose a clean path to collect a current cache. This policy does not change the
+explicit GPTQ calibration-data input interface.
+
+Inlining changes only the selected graph and retains raw storage. A conventional
+`.onnx.data` filename does not establish ownership; another graph can still use
+those bytes. Stage owners retire their recorded inputs, while packages include
+only the selected graphs' actual dependency closure.
+
 ## Shared-weight recovery
 
 Sharing publishes the canonical `decoder_weights[.<suffix>].data` only after

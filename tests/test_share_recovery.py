@@ -522,7 +522,7 @@ def test_copy_containment_precedes_mkdir(tmp_path):
     output.mkdir()
     outside.mkdir()
     (output / "sub").symlink_to(outside, target_is_directory=True)
-    with pytest.raises(ValueError, match="escapes"):
+    with pytest.raises(ValueError, match="linked parent directory"):
         share.copy_artifact_entry(source, output, "sub/new/file")
     assert list(outside.iterdir()) == []
 

@@ -54,6 +54,7 @@ from src.onnx_artifacts import (
     isolated_onnx_input,
     model_tensors,
     preflight_artifact_mutations,
+    retained_quantization,
     validate_generated_destinations,
     validate_quantization_storage,
     write_artifact_json,
@@ -264,20 +265,13 @@ def main():
     generated_graphs = {f"{name}{bits_suffix}.onnx" for name in args.decoders}
     validate_generated_destinations(args.output, generated_graphs | {f"{name}.data" for name in generated_graphs})
     existing_graphs = inventory_graphs(args.output, generated_graphs)
-    retained_graphs = {name for name in existing_graphs if name.endswith(f"{bits_suffix}.onnx")} - generated_graphs
+    retained_graphs, previous_quantization = retained_quantization(
+        args.output, bits_suffix, generated_graphs, existing=existing_graphs
+    )
     excluded_graphs = (
         generated_graphs | retained_graphs | {f"{name}{bits_suffix}.onnx" for name in ("decoder_init", "decoder_step")}
     )
     excluded_files = excluded_graphs | {f"{name}.data" for name in excluded_graphs}
-    previous_quantization = {}
-    prior_config = Path(args.output) / "config.json"
-    if prior_config.is_file():
-        prior = json.loads(prior_config.read_text())
-        prior_quantization = prior.get("quantization", {})
-        if isinstance(prior_quantization, dict):
-            previous_quantization = {
-                name: tag for name, tag in prior_quantization.items() if f"{name}{bits_suffix}.onnx" in retained_graphs
-            }
     files = {
         fname
         for fname in os.listdir(args.input)

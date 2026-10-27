@@ -26,7 +26,7 @@ from transformers import AutoModel
 from src.artifact_publication import ArtifactStaging
 from src.decoder_wrapper import export_decoder_init, export_decoder_step
 from src.encoder_wrapper import export_encoder
-from src.onnx_artifacts import preflight_artifact_mutations
+from src.onnx_artifacts import external_data_files, preflight_artifact_mutations
 from src.prompt import (
     ASR_TEXT_TOKEN_ID,
     AUDIO_END_TOKEN_ID,
@@ -236,9 +236,6 @@ def _convert_to_fp16(output_dir: str, filenames: list[str]):
         m = optimize_model(path, model_type="gpt2", opt_level=0)
         m.convert_float_to_float16(keep_io_types=True)
 
-        # Remove old external data before saving
-        if os.path.exists(data_path):
-            os.remove(data_path)
         m.save_model_to_file(path)
 
         size_after = os.path.getsize(path)
@@ -335,14 +332,10 @@ def main():
             opset_version=args.opset,
             device=args.device,
         )
-        # Embed encoder weights into the .onnx proto (eliminates encoder.onnx.data).
-        # Safe for all model sizes: 0.6B=751MB, 1.7B=1.28GB — well under protobuf 2GB limit.
-        encoder_data = encoder_path + ".data"
-        if os.path.exists(encoder_data):
+        if external_data_files(encoder_path):
             print("  Embedding encoder weights into .onnx proto...")
             enc = onnx.load(encoder_path, load_external_data=True)
             onnx.save(enc, encoder_path)
-            os.remove(encoder_data)
 
         if args.dtype == "fp16":
             print("\n=== Converting encoder to FP16 ===")
@@ -376,14 +369,12 @@ def main():
         # INT8 / ~1.2 GB FP16 / ~2.4 GB FP32). FP32 exceeds the limit and stays
         # as external data.
         step_path = os.path.join(args.output, "decoder_step.onnx")
-        step_data = step_path + ".data"
-        if os.path.exists(step_data):
+        if external_data_files(step_path):
             step_model = onnx.load(step_path, load_external_data=True)
             proto_size = sum(len(t.raw_data) for t in step_model.graph.initializer)
             if proto_size < 1_800_000_000:  # ~1.8 GB safety margin for protobuf
                 print("  Inlining decoder_step weights into .onnx proto...")
                 onnx.save(step_model, step_path)
-                os.remove(step_data)
                 print(f"  decoder_step.onnx: {os.path.getsize(step_path) / 1e6:.1f} MB (self-contained)")
             else:
                 print(f"  decoder_step too large to inline ({proto_size / 1e6:.0f} MB), keeping external data")

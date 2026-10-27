@@ -34,6 +34,7 @@ import argparse
 import io
 import os
 import time
+from pathlib import Path
 
 import numpy as np
 import onnx
@@ -46,9 +47,11 @@ from export import (
     load_model,
     write_config,
 )
+from src.calibration_cache import cache_key, load_cache, model_fingerprint, recipe, save_cache, tokenizer_fingerprint
 from src.decoder_wrapper import export_decoder_init, export_decoder_step
 from src.encoder_wrapper import export_encoder
 from src.mel import log_mel_spectrogram
+from src.onnx_artifacts import external_data_files
 from src.prompt import build_prompt_ids, load_prompt_tokenizer
 from src.tokenizer_assets import validate_tokenizer_destination
 from validate import greedy_decode_pytorch, run_encoder_pytorch
@@ -383,8 +386,8 @@ def main():
         "--activations-cache",
         type=str,
         default=None,
-        help="Path to .npz file for loading/saving calibration activations. "
-        "If the file exists, calibration is skipped (useful for alpha sweeps).",
+        help="Path to a provenance-matching numeric activation cache (.npz). "
+        "An unverifiable existing file is preserved and rejected.",
     )
     parser.add_argument(
         "--device",
@@ -412,25 +415,33 @@ def main():
     validate_tokenizer_destination(args.output)
     os.makedirs(args.output, exist_ok=True)
 
-    # Determine activations cache path
-    acts_cache = args.activations_cache or os.path.join(args.output, "calibration_activations.npz")
-
     # Load model
     model = load_model(args.model, device=args.device, dtype=torch.float32)
     tokenizer = load_prompt_tokenizer(args.model)
 
-    # Collect or load calibration activations
-    if os.path.exists(acts_cache):
-        print(f"Loading cached activations from {acts_cache}")
-        data = np.load(acts_cache)
-        activations = {k: torch.from_numpy(data[k]) for k in data.files}
-        print(f"  Loaded {len(activations)} activation vectors")
+    identity = recipe(
+        "awq",
+        {
+            "checkpoint": model_fingerprint(model),
+            "tokenizer": tokenizer_fingerprint(tokenizer),
+        },
+        {"n_samples": args.n_samples, "device": args.device},
+        Path(__file__),
+    )
+    acts_cache = (
+        Path(args.activations_cache)
+        if args.activations_cache
+        else Path(args.output) / f"calibration_activations_{cache_key(identity)}.npz"
+    )
+    cached = load_cache(acts_cache, identity)
+    if cached is not None:
+        activations = {name: torch.from_numpy(value) for name, value in cached.items()}
+        print(f"Loaded {len(activations)} activation vectors from {acts_cache}")
     else:
         t0 = time.time()
         activations = collect_activations(model, n_samples=args.n_samples, tokenizer=tokenizer, device=args.device)
-        print(f"  Collection done in {time.time() - t0:.1f}s")
-        np.savez(acts_cache, **{k: v.numpy() for k, v in activations.items()})
-        print(f"  Activations saved to {acts_cache}")
+        print(f"Collection done in {time.time() - t0:.1f}s")
+        save_cache(acts_cache, identity, {name: value.cpu().numpy() for name, value in activations.items()})
 
     # Compute smoothing scales
     print(f"\nComputing scales (alpha={args.alpha})...")
@@ -467,12 +478,10 @@ def main():
         print("\n=== Exporting encoder ===")
         encoder_path = os.path.join(args.output, "encoder.onnx")
         export_encoder(model, encoder_path, opset_version=args.opset, device=args.device)
-        encoder_data = encoder_path + ".data"
-        if os.path.exists(encoder_data):
+        if external_data_files(encoder_path):
             print("  Embedding encoder weights into .onnx proto...")
             enc = onnx.load(encoder_path, load_external_data=True)
             onnx.save(enc, encoder_path)
-            os.remove(encoder_data)
     else:
         print("\n=== Encoder skipped (--skip-encoder) ===")
 
