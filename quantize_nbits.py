@@ -34,7 +34,6 @@ import argparse
 import json
 import os
 import shutil
-import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -49,13 +48,14 @@ from onnxruntime.quantization.matmul_nbits_quantizer import (
 )
 from onnxruntime.quantization.quant_utils import QuantFormat
 
-from share_weights import (
+from src.artifact_publication import ArtifactStaging
+from src.onnx_artifacts import (
     copy_artifact_entry,
     external_data_files,
     get_external_info,
+    inventory_graphs,
     model_tensors,
-    protect_retained_graphs,
-    transport_graph_files,
+    preflight_artifact_mutations,
     validate_generated_destinations,
     write_artifact_json,
 )
@@ -64,6 +64,7 @@ from src.tokenizer_assets import (
     copy_tokenizer_assets,
     tokenizer_asset_names,
     validate_tokenizer_assets,
+    validate_tokenizer_destination,
 )
 
 
@@ -118,7 +119,7 @@ def _quantized_nodes(graph):
 
 
 def verify_quantized_precision(model, bits, block_size):
-    nodes = list(_quantized_nodes(model.graph))
+    nodes = [node for graph in (model.graph, *model.functions) for node in _quantized_nodes(graph)]
     if not nodes:
         raise ValueError("No MatMulNBits operators were produced; refusing to label an unquantized model")
     for node in nodes:
@@ -139,8 +140,8 @@ def _quantization_input(input_path: str, algo: str) -> Iterator[tuple[onnx.Model
         return
     source = Path(input_path).resolve()
     dependencies = sorted(external_data_files(source))
-    with tempfile.TemporaryDirectory(prefix="qwen-gptq-") as temporary:
-        stage = Path(temporary)
+    with ArtifactStaging(prefix="qwen-gptq-", dir=None) as staging:
+        stage = staging.path
         locations = {path: f"weights/{index}.data" for index, path in enumerate(dependencies)}
         for path, location in locations.items():
             target = stage / location
@@ -164,6 +165,7 @@ def _quantization_input(input_path: str, algo: str) -> Iterator[tuple[onnx.Model
         staged_model = stage / "model.onnx"
         staged_model.write_bytes(model.SerializeToString())
         yield str(staged_model), str(stage)
+        staging.mark_complete()
 
 
 def quantize_decoder(
@@ -259,6 +261,7 @@ def main():
     args = parser.parse_args()
 
     validate_quantization_request(args.bits, args.block_size, args.algo, args.calib_data, args.nodes_to_exclude)
+
     for name in args.decoders:
         if not name or name in {".", ".."} or any(character in name for character in "/\\:"):
             raise ValueError(f"Unsafe model name: {name}")
@@ -269,14 +272,13 @@ def main():
     tokenizer_files = tokenizer_asset_names(args.input)
     if tokenizer_files:
         validate_tokenizer_assets(args.input)
-    if tokenizer_asset_names(args.output):
-        validate_tokenizer_assets(args.output)
+    validate_tokenizer_destination(args.output)
 
     bits_suffix = f".int{args.bits}"
     generated_graphs = {f"{name}{bits_suffix}.onnx" for name in args.decoders}
-    retained_graphs = {
-        path.name for path in Path(args.output).glob(f"*{bits_suffix}.onnx") if path.is_file()
-    } - generated_graphs
+    validate_generated_destinations(args.output, generated_graphs | {f"{name}.data" for name in generated_graphs})
+    existing_graphs = inventory_graphs(args.output, generated_graphs)
+    retained_graphs = {name for name in existing_graphs if name.endswith(f"{bits_suffix}.onnx")} - generated_graphs
     excluded_graphs = (
         generated_graphs | retained_graphs | {f"{name}{bits_suffix}.onnx" for name in ("decoder_init", "decoder_step")}
     )
@@ -298,22 +300,18 @@ def main():
         and os.path.isfile(os.path.join(args.input, fname))
     }
     generated = generated_graphs | {f"{name}.data" for name in generated_graphs}
-    files.update(
-        transport_graph_files(
-            args.input, (name for name in files if name.endswith(".onnx")), generated, {"config.json"}
-        )
-    )
-    files.difference_update(TOKENIZER_FILES)
-    files = protect_retained_graphs(
+    files.discard("config.json")
+    files = preflight_artifact_mutations(
         args.input,
         args.output,
-        retained_graphs,
         files,
         generated=generated,
-        rewritten={"config.json", *tokenizer_files},
+        rewritten={"config.json"},
+        copied_assets=tokenizer_files,
         removed=TOKENIZER_FILES - tokenizer_files if tokenizer_files else (),
+        reads=[f"{name}.onnx" for name in args.decoders],
+        existing=existing_graphs,
     )
-    validate_generated_destinations(args.output, generated)
     os.makedirs(args.output, exist_ok=True)
 
     # Quantize each decoder file
@@ -336,11 +334,10 @@ def main():
     if tokenizer_files:
         copy_tokenizer_assets(args.input, args.output)
 
-    if tokenizer_asset_names(args.output):
-        validate_tokenizer_assets(args.output)
-
     # Update config.json quantization field (merge with existing for split-decoder runs)
-    config_path = os.path.join(args.output, "config.json")
+    config_path = os.path.join(args.input, "config.json")
+    if not os.path.isfile(config_path):
+        config_path = os.path.join(args.output, "config.json")
     if os.path.exists(config_path) and quantized_names:
         with open(config_path) as f:
             cfg = json.load(f)

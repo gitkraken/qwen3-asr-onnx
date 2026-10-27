@@ -50,6 +50,7 @@ from src.decoder_wrapper import export_decoder_init, export_decoder_step
 from src.encoder_wrapper import export_encoder
 from src.mel import log_mel_spectrogram
 from src.prompt import build_prompt_ids, load_prompt_tokenizer
+from src.tokenizer_assets import validate_tokenizer_destination
 from validate import greedy_decode_pytorch, run_encoder_pytorch
 
 # ---------------------------------------------------------------------------
@@ -408,6 +409,7 @@ def main():
         name = args.model.rstrip("/").rsplit("/", 1)[-1]
         args.output = os.path.join("output", name.lower() + "-smooth")
 
+    validate_tokenizer_destination(args.output)
     os.makedirs(args.output, exist_ok=True)
 
     # Determine activations cache path

@@ -98,6 +98,11 @@ checks every generated, copied, rewritten or removed destination. Identical copi
 are omitted; incompatible destinations fail before output mutation, even if the
 source dependency closure reintroduces a previously excluded graph. Use a clean
 output directory when source and retained models require different bytes at one path.
+Graph inventory discovers decoded models by content, while explicitly selected
+models remain strict. Opaque unselected files are preserved, including tensor
+storage with an `.onnx` suffix. The same mutation plan protects retained graphs
+across precision variants and controls the actual sharing of selected decoders.
+Quantization metadata is merged and written only after supporting assets succeed.
 
 Embedding metadata declares `embed_tokens_shape` and `embed_tokens_dtype`.
 Readers validate dimensions, dtype, byte count and finite values. Legacy exports
@@ -127,11 +132,14 @@ a successful release cannot leave an ambiguous stale variant beside it. Choose a
 clean output name or move that file aside explicitly before retrying. The shared tokenizer-asset contract
 validates every transported embedded/JSON/root Jinja template representation across
 conversion and archiving. Export normalizes the selected ASR template to Jinja and
-removes stale legacy JSON. Converters reject conflicting existing tokenizer outputs
-before conversion and validate their resulting prompt metadata before reporting
-success. A locally renderable ASR prompt is required before packaging. Tokenizer assets are validated together in staging,
+removes stale legacy JSON. Converters validate supplied tokenizer metadata as a
+family and publish replacements atomically, allowing stale root templates to be
+repaired. Unsupported additional template directories are refused before writes. A locally renderable ASR prompt is required before packaging. Tokenizer assets are validated together in staging,
 and publication exceptions trigger rollback of their previous set. A failed rollback
-reports the preserved backup path. This does not make an entire
+reports the preserved backup path. Operating-system cleanup errors after a
+completed publication report the leftover path and completed state; a primary
+operation error keeps its identity when staging cleanup raises an `OSError`.
+This does not make an entire
 converter invocation transactional. An archive or validation failure is a failed
 command. Standalone archives include the ONNX external-data closure and replace a
 prior tar only after a complete staged write. Tokenizer validation uses built-in

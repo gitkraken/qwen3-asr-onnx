@@ -38,15 +38,20 @@ from onnxruntime.quantization import (
     quantize_static,
 )
 
-from share_weights import (
+from share_weights import share_external_models
+from src.artifact_metadata import MODEL_METADATA_FILES
+from src.onnx_artifacts import (
     copy_artifact_entry,
-    share_external_models,
-    transport_graph_files,
-    validate_generated_destinations,
+    preflight_artifact_mutations,
     write_artifact_json,
 )
-from src.artifact_metadata import MODEL_METADATA_FILES
-from src.tokenizer_assets import copy_tokenizer_assets, tokenizer_asset_names, validate_tokenizer_assets
+from src.tokenizer_assets import (
+    TOKENIZER_FILES,
+    copy_tokenizer_assets,
+    tokenizer_asset_names,
+    validate_tokenizer_assets,
+    validate_tokenizer_destination,
+)
 
 # ---------------------------------------------------------------------------
 # Calibration data collection
@@ -332,8 +337,7 @@ def main():
     args = parser.parse_args()
     if tokenizer_asset_names(args.input):
         validate_tokenizer_assets(args.input)
-    if tokenizer_asset_names(args.output):
-        validate_tokenizer_assets(args.output)
+    validate_tokenizer_destination(args.output)
 
     converted = {
         f"{stem}.onnx"
@@ -341,13 +345,24 @@ def main():
         if os.path.isfile(os.path.join(args.input, f"{stem}.onnx"))
     }
     generated = converted | {f"{name}.data" for name in converted}
-    if len(converted) == 2 and not args.no_share_weights:
+    share_pair = {"decoder_init.onnx", "decoder_step.onnx"} <= converted and not args.no_share_weights
+    if share_pair:
         generated.add("decoder_weights.data")
     files = {"embed_tokens.bin", *MODEL_METADATA_FILES}
     if os.path.isfile(os.path.join(args.input, "encoder.onnx")):
-        files.update(transport_graph_files(args.input, ["encoder.onnx"], generated, {"config.json"}))
-    files.difference_update(tokenizer_asset_names(args.input))
-    validate_generated_destinations(args.output, generated)
+        files.add("encoder.onnx")
+    tokenizer_files = tokenizer_asset_names(args.input)
+    files.difference_update(tokenizer_files)
+    files = preflight_artifact_mutations(
+        args.input,
+        args.output,
+        files,
+        generated=generated,
+        rewritten={"config.json"},
+        copied_assets=tokenizer_files,
+        removed=TOKENIZER_FILES - tokenizer_files if tokenizer_files else (),
+        reads=converted,
+    )
     os.makedirs(args.output, exist_ok=True)
 
     method_map = {
@@ -423,29 +438,20 @@ def main():
             quant_format=quant_fmt,
         )
 
-    # Share decoder weights
-    if not args.no_share_weights:
-        init_out = os.path.join(args.output, "decoder_init.onnx")
-        step_out = os.path.join(args.output, "decoder_step.onnx")
-        if os.path.exists(init_out) and os.path.exists(step_out):
-            print("\nSharing quantized decoder weights...")
-            share_external_models(args.output)
+    if share_pair:
+        print("\nSharing quantized decoder weights...")
+        share_external_models(args.output)
 
     # Copy encoder and supporting files from input
     print("\nCopying supporting files...")
     for filename in sorted(files):
         src = os.path.join(args.input, filename)
         if os.path.exists(src):
-            dst = os.path.join(args.output, filename)
-            if not os.path.exists(dst):
-                copy_artifact_entry(args.input, args.output, filename)
-                print(f"  Copied {filename}")
+            copy_artifact_entry(args.input, args.output, filename)
+            print(f"  Copied {filename}")
 
     if tokenizer_asset_names(args.input):
         copy_tokenizer_assets(args.input, args.output)
-
-    if tokenizer_asset_names(args.output):
-        validate_tokenizer_assets(args.output)
 
     # Update config
     config_path = os.path.join(args.output, "config.json")

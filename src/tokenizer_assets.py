@@ -1,10 +1,9 @@
 import json
 import shutil
-import tempfile
 from pathlib import Path
 
 from src import prompt
-from src.artifact_publication import publish_artifacts
+from src.artifact_publication import ArtifactStaging, publish_artifacts
 
 TOKENIZER_FILES = frozenset(
     {
@@ -25,10 +24,17 @@ def tokenizer_asset_names(root) -> set[str]:
     return {name for name in TOKENIZER_FILES if (root / name).is_file()}
 
 
+def validate_tokenizer_destination(root):
+    directory = Path(root) / "additional_chat_templates"
+    if directory.is_dir():
+        raise ValueError(f"Unsupported tokenizer template directory: {directory}; use a clean output directory")
+
+
 def validate_tokenizer_assets(root):
     root = Path(root)
     if not root.is_dir():
         raise ValueError(f"Tokenizer directory does not exist: {root}")
+    validate_tokenizer_destination(root)
     for name in ("tokenizer.json", "tokenizer_config.json"):
         if not (root / name).is_file():
             raise ValueError(f"Required tokenizer asset missing: {name}")
@@ -114,6 +120,7 @@ def _validate_shipped_templates(root, tokenizer):
 def copy_tokenizer_assets(source, target) -> None:
     source, target = Path(source), Path(target)
     validate_tokenizer_assets(source)
+    validate_tokenizer_destination(target)
     if source.resolve() == target.resolve():
         return
     names = tokenizer_asset_names(source)
@@ -122,8 +129,8 @@ def copy_tokenizer_assets(source, target) -> None:
         if (target / name).is_dir():
             raise ValueError(f"Tokenizer asset destination is a directory: {target / name}")
     # Existing metadata may link to a retained release; never write through those links.
-    with tempfile.TemporaryDirectory(prefix=".tokenizer-", dir=target) as temp:
-        stage = Path(temp)
+    with ArtifactStaging(prefix=".tokenizer-", dir=target) as staging:
+        stage = staging.path
         for name in sorted(names):
             shutil.copy2(source / name, stage / name)
         validate_tokenizer_assets(stage)
@@ -131,3 +138,4 @@ def copy_tokenizer_assets(source, target) -> None:
             [(stage / name, target / name) for name in sorted(names)],
             [target / name for name in sorted(TOKENIZER_FILES - names)],
         )
+        staging.mark_complete()

@@ -6,16 +6,16 @@ import json
 import os
 import shutil
 import tarfile
-import tempfile
 from pathlib import Path, PurePosixPath
 
 import onnx
 import onnxruntime as ort
 
-from share_weights import graph_file_closure, share_external_models, transport_graph_files
+from share_weights import share_external_models
 from src.artifact_metadata import MODEL_METADATA_FILES
-from src.artifact_publication import publish_artifacts
+from src.artifact_publication import ArtifactStaging, publish_artifacts
 from src.embeddings import load_embed_tokens
+from src.onnx_artifacts import graph_file_closure, inventory_graphs, transport_graph_files
 from src.tokenizer_assets import tokenizer_asset_names, validate_tokenizer_assets
 
 REQUIRED_METADATA = [*MODEL_METADATA_FILES, "tokenizer.json", "tokenizer_config.json"]
@@ -44,7 +44,8 @@ def verify_ort_load(output_dir):
     opts.intra_op_num_threads = 1
     opts.inter_op_num_threads = 1
     try:
-        for path in sorted(Path(output_dir).glob("*.onnx")):
+        for name in sorted(inventory_graphs(output_dir)):
+            path = Path(output_dir) / name
             onnx.checker.check_model(str(path))
             ort.InferenceSession(str(path), opts, providers=["CPUExecutionProvider"])
         return True
@@ -98,7 +99,6 @@ def _validate_archive_target(target, archive_root, variant):
 
 def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
     source = Path(input_dir).resolve()
-    validate_tokenizer_assets(source)
     output = Path(output_dir).absolute()
     archives = {
         variant: output.parent / f"{output.name}{'-int4' if variant else ''}.tar.gz" for variant in ("", "int4")
@@ -117,6 +117,7 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
             metadata = json.load(stream)
         if not isinstance(metadata, dict):
             raise ValueError(f"Required metadata must be a JSON object: {name}")
+    validate_tokenizer_assets(source)
     variants = [variant for variant in ("", "int4") if any((source / name).exists() for name in _graph_names(variant))]
     if not variants:
         raise ValueError("No model variants found")
@@ -157,8 +158,8 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
         if canonical in graph_file_closure(source, unaffected_graphs):
             raise ValueError(f"ONNX transport destination conflict: {canonical}")
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".package-", dir=output.parent) as tmp:
-        stage = Path(tmp)
+    with ArtifactStaging(prefix=".package-", dir=output.parent) as staging:
+        stage = staging.path
         release = stage / output.name
         release.mkdir()
         metadata = set(MODEL_METADATA_FILES) | tokenizer_asset_names(source)
@@ -196,6 +197,7 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
             _create_archive(release, archive_path, members, base)
             replacements.append((archive_path, archives[variant]))
         publish_artifacts(replacements)
+        staging.mark_complete()
     print(f"Release directory: {output}")
     return True
 

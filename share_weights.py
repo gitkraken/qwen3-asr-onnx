@@ -10,15 +10,43 @@ owns the working directory can authorize their cleanup.
 
 import argparse
 import hashlib
-import json
-import math
 import os
-import shutil
-import tempfile
 from pathlib import Path
 
 import onnx
-from google.protobuf.descriptor import FieldDescriptor
+
+from src.artifact_publication import ArtifactStaging
+from src.onnx_artifacts import (
+    copy_artifact_entry as copy_artifact_entry,
+)
+from src.onnx_artifacts import (
+    external_data_files as external_data_files,
+)
+from src.onnx_artifacts import (
+    external_tensor_range,
+    file_digest,
+    inventory_graphs,
+    storage_tensors,
+    validate_generated_destinations,
+)
+from src.onnx_artifacts import (
+    get_external_info as get_external_info,
+)
+from src.onnx_artifacts import (
+    graph_file_closure as graph_file_closure,
+)
+from src.onnx_artifacts import (
+    model_tensors as model_tensors,
+)
+from src.onnx_artifacts import (
+    protect_retained_graphs as protect_retained_graphs,
+)
+from src.onnx_artifacts import (
+    transport_graph_files as transport_graph_files,
+)
+from src.onnx_artifacts import (
+    write_artifact_json as write_artifact_json,
+)
 
 SHARED_DATA_NAME = "decoder_weights.data"
 _CHUNK_BYTES = 8 * 1024 * 1024
@@ -31,25 +59,6 @@ def _shared_data_name(suffix=None):
 def _decoder_filenames(suffix=None):
     tag = f".{suffix}" if suffix else ""
     return f"decoder_init{tag}.onnx", f"decoder_step{tag}.onnx"
-
-
-def _storage_tensors(message, initializer=False):
-    if isinstance(message, onnx.TensorProto):
-        yield message, initializer
-        return
-    for field, value in message.ListFields():
-        if field.type != FieldDescriptor.TYPE_MESSAGE:
-            continue
-        if field.is_repeated:
-            for item in value:
-                yield from _storage_tensors(item, field.name == "initializer")
-        else:
-            yield from _storage_tensors(value, field.name == "initializer")
-
-
-def model_tensors(message):
-    for tensor, _ in _storage_tensors(message):
-        yield tensor
 
 
 def _can_share(tensor, root, initializer):
@@ -68,139 +77,18 @@ def _can_share(tensor, root, initializer):
     ):
         return False
     length = (
-        _external_range(root, tensor)[2] if tensor.data_location == onnx.TensorProto.EXTERNAL else len(tensor.raw_data)
+        external_tensor_range(root, tensor)[2]
+        if tensor.data_location == onnx.TensorProto.EXTERNAL
+        else len(tensor.raw_data)
     )
     return length >= 1024
-
-
-def get_external_info(tensor):
-    return {entry.key: entry.value for entry in tensor.external_data}
-
-
-def _external_range(root, tensor):
-    info = get_external_info(tensor)
-    location = info.get("location", "")
-    if not location or "\\" in location or Path(location).is_absolute():
-        raise ValueError(f"Invalid external data location: {location!r}")
-    root = Path(root).resolve()
-    if ".." in Path(location).parts:
-        raise ValueError(f"Invalid external data location: {location!r}")
-    path = root / location
-    if path.resolve() != path or not path.is_file():
-        raise ValueError(f"External data missing or outside model directory: {location}")
-    size = path.stat().st_size
-    offset = int(info.get("offset", "0"))
-    length = int(info.get("length", str(size - offset)))
-    if offset < 0 or length < 0 or offset + length > size:
-        raise ValueError(f"Invalid external data range for {tensor.name}")
-    dtype_name = onnx.TensorProto.DataType.Name(tensor.data_type)
-    if dtype_name == "STRING":
-        raise ValueError("External string tensors are unsupported")
-    if dtype_name in ("INT4", "UINT4", "FLOAT4E2M1"):
-        bits = 4
-    elif dtype_name in ("INT2", "UINT2"):
-        bits = 2
-    else:
-        bits = onnx.helper.tensor_dtype_to_np_dtype(tensor.data_type).itemsize * 8
-    expected = (math.prod(tensor.dims) * bits + 7) // 8
-    if length != expected:
-        raise ValueError(f"External tensor {tensor.name} has {length} bytes; expected {expected}")
-    return path, offset, length
-
-
-def external_data_files(model_path):
-    path = Path(model_path).resolve()
-    model = onnx.load(path, load_external_data=False)
-    return {
-        _external_range(path.parent, tensor)[0]
-        for tensor in model_tensors(model)
-        if tensor.data_location == onnx.TensorProto.EXTERNAL
-    }
-
-
-def graph_file_closure(root, names):
-    root = Path(root).resolve()
-    graphs = set(names)
-    return graphs | _graph_dependencies(root, graphs)
-
-
-def _graph_dependencies(root, names):
-    return {path.relative_to(root).as_posix() for name in names for path in external_data_files(root / name)}
-
-
-def transport_graph_files(root, graphs, generated=(), rewritten=()):
-    root = Path(root).resolve()
-    graphs = set(graphs)
-    dependencies = _graph_dependencies(root, graphs)
-    files = graphs | dependencies
-    conflicts = (files & set(generated)) | (dependencies & set(rewritten))
-    if conflicts:
-        raise ValueError(f"ONNX transport destination conflict: {', '.join(sorted(conflicts))}")
-    return files
-
-
-def protect_retained_graphs(source, output, graphs, copies, *, generated=(), rewritten=(), removed=()):
-    source, output = Path(source).resolve(), Path(output).resolve()
-    reserved = graph_file_closure(output, graphs)
-    copies = set(copies)
-    conflicts = reserved & (set(generated) | set(rewritten) | set(removed))
-    for name in copies & reserved:
-        original, retained = source / name, output / name
-        if original.stat().st_size == retained.stat().st_size and _file_digest(original) == _file_digest(retained):
-            copies.remove(name)
-        else:
-            conflicts.add(name)
-    if conflicts:
-        raise ValueError(f"ONNX retained graph destination conflict: {', '.join(sorted(conflicts))}")
-    return copies
-
-
-def validate_generated_destinations(output, names):
-    root = Path(output).absolute()
-    if root.is_symlink():
-        raise ValueError(f"ONNX transport destination conflict: linked output directory {root}")
-    resolved_root = root.resolve()
-    for name in names:
-        destination = root / name
-        if not destination.parent.resolve().is_relative_to(resolved_root):
-            raise ValueError(f"ONNX transport destination conflict: {name}")
-        if destination.is_symlink() or (destination.exists() and destination.stat().st_nlink > 1):
-            raise ValueError(f"ONNX transport destination conflict: linked {name}")
-
-
-def copy_artifact_entry(source, output, name):
-    root = Path(output).resolve()
-    destination = Path(output) / name
-    if not destination.parent.resolve().is_relative_to(root):
-        raise ValueError(f"Artifact destination escapes output directory: {name}")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if not destination.parent.resolve().is_relative_to(root):
-        raise ValueError(f"Artifact destination escapes output directory: {name}")
-    with tempfile.NamedTemporaryFile(prefix=".artifact-", dir=destination.parent, delete=False) as temporary:
-        staged = Path(temporary.name)
-    try:
-        shutil.copy2(Path(source) / name, staged)
-        os.replace(staged, destination)
-    finally:
-        staged.unlink(missing_ok=True)
-
-
-def write_artifact_json(output, name, value):
-    destination = Path(output) / name
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".artifact-", dir=destination.parent) as temp:
-        staged = Path(temp) / "value.json"
-        with staged.open("w") as stream:
-            json.dump(value, stream, indent=2)
-        staged.chmod(0o644)
-        os.replace(staged, destination)
 
 
 def _tensor_chunks(tensor, root):
     if tensor.data_location != onnx.TensorProto.EXTERNAL:
         yield tensor.raw_data
         return
-    path, offset, remaining = _external_range(root, tensor)
+    path, offset, remaining = external_tensor_range(root, tensor)
     with path.open("rb") as stream:
         stream.seek(offset)
         while remaining:
@@ -249,23 +137,14 @@ def _write_shared_data(storage, root, path):
         os.fsync(stream.fileno())
 
 
-def _file_digest(path):
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").digest()
-
-
 def _live_data_files(root, excluded):
-    live = set()
-    for path in root.rglob("*.onnx"):
-        if path not in excluded:
-            try:
-                live.update(external_data_files(path))
-            except Exception as error:
-                raise ValueError(
-                    f"Cannot inventory independent graph {path}; preserve it and repair its references "
-                    "or move abandoned staging outside the model directory before retrying."
-                ) from error
-    return live
+    inventory = inventory_graphs(root)
+    return {
+        root / dependency
+        for name, dependencies in inventory.items()
+        if root / name not in excluded
+        for dependency in dependencies
+    }
 
 
 def _publish_data(staged, target):
@@ -275,7 +154,7 @@ def _publish_data(staged, target):
         identical = (
             target.is_file()
             and staged.stat().st_size == target.stat().st_size
-            and _file_digest(staged) == _file_digest(target)
+            and file_digest(staged) == file_digest(target)
         )
         if identical:
             return
@@ -311,22 +190,32 @@ def share_external_models(model_dir, suffix=None):
     shared_name = _shared_data_name(suffix)
     validate_generated_destinations(root, [shared_name])
     _validate_models(root, names)
-    live = _live_data_files(root, {root / name for name in names})
-    already_shared = (root / shared_name).is_file() and bool(old_files) and old_files <= {root / shared_name}
-    if already_shared:
-        _validate_runtime_models(root, names)
-        return True
-    conflicts = live & {root / name for name in names}
-    if conflicts:
-        raise ValueError(f"ONNX transport destination conflict: {', '.join(sorted(path.name for path in conflicts))}")
     storage = [
         (tensor, _can_share(tensor, root, initializer))
         for model in models
-        for tensor, initializer in _storage_tensors(model)
+        for tensor, initializer in storage_tensors(model)
     ]
+    live = _live_data_files(root, {root / name for name in names})
+    canonical = root / shared_name
+    already_shared = (
+        canonical.is_file()
+        and old_files <= {canonical}
+        and all(
+            tensor.data_location == onnx.TensorProto.EXTERNAL and external_tensor_range(root, tensor)[0] == canonical
+            for tensor, shareable in storage
+            if shareable
+        )
+        and (bool(old_files) or (canonical.stat().st_size == 0 and not any(shareable for _, shareable in storage)))
+    )
+    if already_shared:
+        _validate_runtime_models(root, names)
+        return True
+    conflicts = (live | old_files) & {root / name for name in names}
+    if conflicts:
+        raise ValueError(f"ONNX transport destination conflict: {', '.join(sorted(path.name for path in conflicts))}")
     # A process exit must not leave transient graphs inside the recursive consumer inventory.
-    with tempfile.TemporaryDirectory(prefix=".share-", dir=root.parent) as tmp:
-        stage = Path(tmp)
+    with ArtifactStaging(prefix=".share-", dir=root.parent) as staging:
+        stage = staging.path
         _write_shared_data(storage, root, stage / shared_name)
         for model, name in zip(models, names):
             with open(stage / name, "wb") as stream:
@@ -339,6 +228,7 @@ def share_external_models(model_dir, suffix=None):
         for name in names:
             os.replace(stage / name, root / name)
         _validate_models(root, names)
+        staging.mark_complete()
     return True
 
 

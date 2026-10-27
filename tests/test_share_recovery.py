@@ -10,7 +10,6 @@ import onnx
 import onnxruntime as ort
 import pytest
 import torch
-from google.protobuf.message import DecodeError
 from onnx import TensorProto, helper, numpy_helper
 
 import share_weights as share
@@ -124,6 +123,12 @@ def test_interruption_after_graph_replace_can_retry(tmp_path, monkeypatch, inlin
     assert share.share_external_models(tmp_path)
     _assert_pair(tmp_path, expected)
     _assert_shared(tmp_path)
+
+    for name in ("decoder_init.onnx", "decoder_step.onnx"):
+        model = onnx.load(tmp_path / name, load_external_data=False)
+        weight = next(tensor for tensor in model.graph.initializer if tensor.name == "weight")
+        assert weight.data_location == TensorProto.EXTERNAL
+        assert share.get_external_info(weight)["location"] == "decoder_weights.data"
 
 
 def test_sharing_retains_original_data_without_unlinking(tmp_path, monkeypatch):
@@ -423,12 +428,13 @@ def test_unrelated_invalid_graph_rejected_before_decoder_publication(tmp_path, a
         assert share.share_external_models(tmp_path)
     graph = tmp_path / auxiliary
     graph.parent.mkdir(parents=True, exist_ok=True)
-    graph.write_bytes(b"invalid unrelated graph")
+    _write_model(graph.parent, graph.name, external=True)
+    Path(f"{graph}.data").unlink()
     before = {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
     for _ in range(2):
         with pytest.raises(ValueError, match="Cannot inventory independent graph") as caught:
             share.share_external_models(tmp_path)
-        assert isinstance(caught.value.__cause__, DecodeError)
+        assert isinstance(caught.value.__cause__, ValueError)
         assert {
             path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()
         } == before
@@ -565,3 +571,19 @@ def test_sharing_protects_independent_graph_storage(tmp_path):
         share.share_external_models(tmp_path)
     assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before
     np.testing.assert_array_equal(_ort_result(tmp_path / "encoder.onnx"), [0])
+
+
+@pytest.mark.parametrize("auxiliary", ["opaque.onnx", "nested/opaque.onnx"])
+@pytest.mark.parametrize("already_shared", [False, True])
+def test_opaque_files_are_preserved_during_sharing_and_retry(tmp_path, auxiliary, already_shared):
+    expected = _pair(tmp_path)
+    if already_shared:
+        assert share.share_external_models(tmp_path)
+    opaque = tmp_path / auxiliary
+    opaque.parent.mkdir(parents=True, exist_ok=True)
+    data = b"opaque bytes with no ONNX graph identity"
+    opaque.write_bytes(data)
+    for _ in range(2):
+        assert share.share_external_models(tmp_path)
+        assert opaque.read_bytes() == data
+        _assert_pair(tmp_path, expected)

@@ -37,7 +37,7 @@ from src.prompt import (
     build_prompt_ids,
     load_prompt_tokenizer,
 )
-from src.tokenizer_assets import validate_tokenizer_assets
+from src.tokenizer_assets import validate_tokenizer_assets, validate_tokenizer_destination
 
 
 def load_model(model_id: str, device: str = "cpu", dtype=torch.float32):
@@ -78,6 +78,7 @@ def load_model(model_id: str, device: str = "cpu", dtype=torch.float32):
 
 def copy_tokenizer(model_id: str, output_dir: str):
     """Copy tokenizer.json from the HuggingFace model."""
+    validate_tokenizer_destination(output_dir)
     tokenizer = load_prompt_tokenizer(model_id)
 
     # Save tokenizer files
@@ -343,6 +344,7 @@ def main():
     if args.output is None:
         args.output = _default_output_dir(args.model)
 
+    validate_tokenizer_destination(args.output)
     os.makedirs(args.output, exist_ok=True)
 
     # Always load in FP32 initially — encoder needs FP32 for mel spectrogram input.

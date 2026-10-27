@@ -21,10 +21,9 @@ import tempfile
 import onnx
 from onnxruntime.quantization import QuantType, quantize_dynamic
 
-from share_weights import (
+from src.onnx_artifacts import (
     copy_artifact_entry,
-    transport_graph_files,
-    validate_generated_destinations,
+    preflight_artifact_mutations,
     write_artifact_json,
 )
 from src.tokenizer_assets import (
@@ -32,6 +31,7 @@ from src.tokenizer_assets import (
     copy_tokenizer_assets,
     tokenizer_asset_names,
     validate_tokenizer_assets,
+    validate_tokenizer_destination,
 )
 
 ONNX_FILES = ["encoder.onnx", "decoder_init.onnx", "decoder_step.onnx"]
@@ -139,8 +139,7 @@ def main():
     args = parser.parse_args()
     if tokenizer_asset_names(args.input):
         validate_tokenizer_assets(args.input)
-    if tokenizer_asset_names(args.output):
-        validate_tokenizer_assets(args.output)
+    validate_tokenizer_destination(args.output)
 
     suffix = f".{args.weight_type}"
     files = {
@@ -154,13 +153,17 @@ def main():
         if os.path.isfile(os.path.join(args.input, name))
     }
     generated = generated_graphs | {f"{name}.data" for name in generated_graphs}
-    files.update(
-        transport_graph_files(
-            args.input, (name for name in files if name.endswith(".onnx")), generated, {"config.json"}
-        )
+    tokenizer_files = tokenizer_asset_names(args.input)
+    files = preflight_artifact_mutations(
+        args.input,
+        args.output,
+        files,
+        generated=generated,
+        rewritten={"config.json"},
+        copied_assets=tokenizer_files,
+        removed=TOKENIZER_FILES - tokenizer_files if tokenizer_files else (),
+        reads=ONNX_FILES,
     )
-    files.difference_update(TOKENIZER_FILES)
-    validate_generated_destinations(args.output, generated)
     os.makedirs(args.output, exist_ok=True)
 
     # Parse weight type
@@ -228,9 +231,6 @@ def main():
 
     if tokenizer_asset_names(args.input):
         copy_tokenizer_assets(args.input, args.output)
-
-    if tokenizer_asset_names(args.output):
-        validate_tokenizer_assets(args.output)
 
     # Update config.json quantization metadata
     config_path = os.path.join(args.output, "config.json")

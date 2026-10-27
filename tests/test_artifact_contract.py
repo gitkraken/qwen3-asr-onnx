@@ -353,7 +353,7 @@ def test_unusable_tokenizer_contract_preserves_previous_release(tmp_path, proble
 
     monkeypatch.setattr(pack, "validate_tokenizer_assets", validate_and_record)
     assert not pack.package(str(source), str(output))
-    assert reached == ["release"]
+    assert reached == ["source"]
     assert {p.relative_to(output): p.read_bytes() for p in output.rglob("*") if p.is_file()} == previous
     assert archive.read_bytes() == archive_bytes
 
@@ -593,6 +593,14 @@ def test_existing_shared_layout_is_preserved_on_share_and_package(tmp_path, layo
         _write_external_identity(source, "decoder_step.onnx", canonical.name, offset, np.int64)
     before = {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()}
     expected = {name: _ort_result(source / name) for name in share._decoder_filenames()}
+    if layout == "inline-step":
+        with pytest.raises(ValueError, match="Canonical shared data has incompatible bytes"):
+            share.share_external_models(source)
+        assert {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()} == before
+        assert not pack.package(source, tmp_path / "release")
+        for name, values in expected.items():
+            np.testing.assert_array_equal(_ort_result(source / name), values)
+        return
     assert share.share_external_models(source)
     assert {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()} == before
     output = tmp_path / "release"

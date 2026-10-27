@@ -171,3 +171,64 @@ def test_interruption_after_final_restore_reports_destinations_and_backup(tmp_pa
     assert str(backups[0]) in str(caught.value)
     assert "inspect the destination files and backup directory" in str(caught.value)
     assert "previous artifacts remain" not in str(caught.value)
+
+
+def test_backup_cleanup_error_preserves_restored_failure_identity(tmp_path, monkeypatch, capsys):
+    import src.artifact_publication as publication
+
+    original, staged = tmp_path / "original", tmp_path / "staged"
+    original.write_text("old")
+    staged.write_text("new")
+    replace = os.replace
+    cleanup = publication.shutil.rmtree
+
+    def fail_install(source, target):
+        if Path(source) == staged:
+            raise OSError("install failed")
+        return replace(source, target)
+
+    def fail_cleanup(path, *args, **kwargs):
+        if Path(path).name.startswith(".release-backup-"):
+            raise PermissionError("cleanup failed")
+        return cleanup(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", fail_install)
+    monkeypatch.setattr(publication.shutil, "rmtree", fail_cleanup)
+    with pytest.raises(OSError, match="install failed"):
+        publication.publish_artifacts([(staged, original)])
+    assert original.read_text() == "old"
+    output = capsys.readouterr().out
+    assert "Original artifacts restored" in output
+    backups = list(tmp_path.glob(".release-backup-*"))
+    assert backups and str(backups[0]) in output
+
+
+@pytest.mark.parametrize("state", ["completed", "primary-error", "incomplete"])
+def test_staging_cleanup_preserves_publication_outcome(tmp_path, monkeypatch, capsys, state):
+    from src.artifact_publication import ArtifactStaging
+
+    staging = ArtifactStaging(prefix="stage-", dir=tmp_path)
+    cleanup = publication.shutil.rmtree
+    primary = ValueError("primary operation failure")
+
+    def fail_cleanup(path, *args, **kwargs):
+        if Path(path) == staging.path:
+            raise PermissionError("staging cleanup failed")
+        return cleanup(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(publication.shutil, "rmtree", fail_cleanup)
+        if state == "completed":
+            with staging:
+                staging.mark_complete()
+        elif state == "primary-error":
+            with pytest.raises(ValueError) as failure, staging:
+                raise primary
+            assert failure.value is primary
+        else:
+            with pytest.raises(PermissionError, match="staging cleanup failed"), staging:
+                pass
+    if state != "incomplete":
+        assert str(staging.path) in capsys.readouterr().out
+    assert staging.path.is_dir()
+    cleanup(staging.path)

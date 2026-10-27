@@ -200,28 +200,35 @@ def test_missing_decoder_fails_before_output(tmp_path):
     assert not output.exists()
 
 
-def _split_output(tmp_path, stem="decoder_init"):
+@pytest.fixture(params=["rtn", "gptq"])
+def split_algorithm(request):
+    return request.param
+
+
+def _split_output(tmp_path, stem="decoder_init", algo="rtn"):
     inputs, calib = source(tmp_path)
     if stem != "decoder_init":
         shutil.copy2(inputs / "decoder_init.onnx", inputs / f"{stem}.onnx")
-    baseline = cli(inputs, inputs, "--decoders", *sorted(path.stem for path in inputs.glob("*.onnx")))
+    baseline = cli(
+        inputs, inputs, "--decoders", *sorted(path.stem for path in inputs.glob("*.onnx")), "--block-size", "16"
+    )
     assert baseline.returncode == 0, baseline.stdout + baseline.stderr
     output = tmp_path / "out"
-    first = cli(inputs, output, "--decoders", stem, "--algo", "gptq", "--calib-data", str(calib))
+    first = cli(inputs, output, "--decoders", stem, "--algo", algo, "--calib-data", str(calib))
     assert first.returncode == 0, first.stdout + first.stderr
     assert (output / f"{stem}.int4.onnx").read_bytes() != (inputs / f"{stem}.int4.onnx").read_bytes()
     return inputs, output
 
 
 @pytest.mark.parametrize("stem", ["decoder_init", "encoder"])
-def test_split_quantization_keeps_previously_generated_sibling(tmp_path, stem):
-    inputs, output = _split_output(tmp_path, stem)
+def test_split_quantization_keeps_previously_generated_sibling(tmp_path, stem, split_algorithm):
+    inputs, output = _split_output(tmp_path, stem, split_algorithm)
     generated = (output / f"{stem}.int4.onnx").read_bytes()
     second = cli(inputs, output, "--decoders", "decoder_step")
     assert second.returncode == 0, second.stdout + second.stderr
     assert (output / f"{stem}.int4.onnx").read_bytes() == generated
     metadata = json.loads((output / "config.json").read_text())["quantization"]
-    assert metadata[stem] == "int4_gptq_block32"
+    assert metadata[stem] == f"int4_{split_algorithm}_block32"
     assert metadata["decoder_step"] == "int4_rtn_block32"
     model = onnx.load(output / f"{stem}.int4.onnx")
     nodes = [node for node in model.graph.node if node.op_type == "MatMulNBits"]
@@ -254,10 +261,10 @@ def _relocate_split_weights(output, name):
     return graph, destination
 
 
-def test_split_source_closure_cannot_replace_retained_graph(tmp_path):
+def test_split_source_closure_cannot_replace_retained_graph(tmp_path, split_algorithm):
     from tests.test_artifact_contract import _write_external_identity
 
-    inputs, output = _split_output(tmp_path)
+    inputs, output = _split_output(tmp_path, algo=split_algorithm)
     _write_external_identity(inputs, "encoder.onnx", "decoder_init.int4.onnx")
     before = _output_bytes(output)
     result = cli(inputs, output, "--decoders", "decoder_step")
@@ -266,8 +273,8 @@ def test_split_source_closure_cannot_replace_retained_graph(tmp_path):
     assert _output_bytes(output) == before
 
 
-def test_split_source_copy_cannot_change_retained_weights(tmp_path):
-    inputs, output = _split_output(tmp_path)
+def test_split_source_copy_cannot_change_retained_weights(tmp_path, split_algorithm):
+    inputs, output = _split_output(tmp_path, algo=split_algorithm)
     graph, data = _relocate_split_weights(output, "retained-weights.data")
     (inputs / data.name).write_bytes(bytes(data.stat().st_size))
     options = ort.SessionOptions()
@@ -286,8 +293,8 @@ def test_split_source_copy_cannot_change_retained_weights(tmp_path):
     np.testing.assert_array_equal(actual, expected)
 
 
-def test_split_source_identical_retained_weights_are_usable(tmp_path):
-    inputs, output = _split_output(tmp_path)
+def test_split_source_identical_retained_weights_are_usable(tmp_path, split_algorithm):
+    inputs, output = _split_output(tmp_path, algo=split_algorithm)
     graph, data = _relocate_split_weights(output, "retained-weights.data")
     shutil.copy2(data, inputs / data.name)
     before = graph.read_bytes(), data.read_bytes()
@@ -296,8 +303,8 @@ def test_split_source_identical_retained_weights_are_usable(tmp_path):
     assert (graph.read_bytes(), data.read_bytes()) == before
 
 
-def test_split_generated_graph_cannot_replace_retained_tensor_storage(tmp_path):
-    inputs, output = _split_output(tmp_path)
+def test_split_generated_graph_cannot_replace_retained_tensor_storage(tmp_path, split_algorithm):
+    inputs, output = _split_output(tmp_path, algo=split_algorithm)
     _relocate_split_weights(output, "decoder_step.int4.onnx")
     before = _output_bytes(output)
     result = cli(inputs, output, "--decoders", "decoder_step")
@@ -306,10 +313,10 @@ def test_split_generated_graph_cannot_replace_retained_tensor_storage(tmp_path):
     assert _output_bytes(output) == before
 
 
-def test_split_tokenizer_removal_cannot_delete_retained_tensor_storage(tmp_path):
+def test_split_tokenizer_removal_cannot_delete_retained_tensor_storage(tmp_path, split_algorithm):
     from tests.tokenizer_fixtures import save_tokenizer_assets
 
-    inputs, output = _split_output(tmp_path)
+    inputs, output = _split_output(tmp_path, algo=split_algorithm)
     _relocate_split_weights(output, "chat_template.jinja")
     save_tokenizer_assets(inputs, template_format="embedded")
     before = _output_bytes(output)
@@ -514,3 +521,104 @@ def test_unsafe_model_name_is_rejected_before_output(tmp_path, name):
     assert result.returncode != 0
     assert "Unsafe model name" in result.stderr
     assert not output.exists()
+
+
+def test_failed_asset_publication_does_not_destroy_retained_quantization_provenance(tmp_path, monkeypatch):
+    import quantize_nbits
+    from src.tokenizer_assets import copy_tokenizer_assets
+    from tests.tokenizer_fixtures import save_tokenizer_assets
+
+    inputs, output = _split_output(tmp_path)
+    save_tokenizer_assets(inputs, "embedded")
+    prior = (output / "config.json").read_bytes()
+    graph = (output / "decoder_init.int4.onnx").read_bytes()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "quantize_nbits.py",
+            "--input",
+            str(inputs),
+            "--output",
+            str(output),
+            "--bits",
+            "4",
+            "--block-size",
+            "32",
+            "--decoders",
+            "decoder_step",
+        ],
+    )
+
+    def fail_after_ordinary_copies(*args):
+        raise OSError("asset publication failed")
+
+    monkeypatch.setattr(quantize_nbits, "copy_tokenizer_assets", fail_after_ordinary_copies)
+    with pytest.raises(OSError, match="asset publication failed"):
+        quantize_nbits.main()
+    assert (output / "config.json").read_bytes() == prior
+    assert (output / "decoder_init.int4.onnx").read_bytes() == graph
+    monkeypatch.setattr(quantize_nbits, "copy_tokenizer_assets", copy_tokenizer_assets)
+    quantize_nbits.main()
+    tags = json.loads((output / "config.json").read_text())["quantization"]
+    assert tags["decoder_init"] == "int4_rtn_block32"
+    assert tags["decoder_step"] == "int4_rtn_block32"
+    assert (output / "decoder_init.int4.onnx").read_bytes() == graph
+
+
+@pytest.mark.parametrize("function_bits", [4, 8])
+def test_precision_guard_checks_local_function_operators(function_bits):
+    from quantize_nbits import verify_quantized_precision
+
+    def operator(bits):
+        return helper.make_node(
+            "MatMulNBits", ["x", "w", "scales"], ["y"], domain="com.microsoft", bits=bits, block_size=32
+        )
+
+    function = helper.make_function(
+        "local",
+        "Quantized",
+        ["x", "w", "scales"],
+        ["y"],
+        [operator(function_bits)],
+        [helper.make_opsetid("com.microsoft", 1)],
+    )
+    graph = helper.make_graph([operator(4)], "root", [], [])
+    model = helper.make_model(graph, functions=[function])
+    if function_bits == 4:
+        verify_quantized_precision(model, 4, 32)
+    else:
+        with pytest.raises(ValueError, match="bits=8"):
+            verify_quantized_precision(model, 4, 32)
+
+
+def test_gptq_completed_output_survives_input_staging_cleanup_error(tmp_path, monkeypatch, capsys):
+    import quantize_nbits
+    from src import artifact_publication
+
+    inputs, calib = source(tmp_path)
+    before = {path.name: path.read_bytes() for path in inputs.iterdir()}
+    output = tmp_path / "result.int4.onnx"
+    cleanup = artifact_publication.shutil.rmtree
+    leftovers = []
+
+    def fail_cleanup(path, *args, **kwargs):
+        path = Path(path)
+        if path.name.startswith("qwen-gptq-"):
+            leftovers.append(path)
+            raise PermissionError("GPTQ staging cleanup failed")
+        return cleanup(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(artifact_publication.shutil, "rmtree", fail_cleanup)
+        quantize_nbits.quantize_decoder(str(inputs / "decoder_init.onnx"), str(output), 4, 32, 4, "gptq", str(calib))
+    model = onnx.load(output)
+    quantize_nbits.verify_quantized_precision(model, 4, 32)
+    session = ort.InferenceSession(str(output), providers=["CPUExecutionProvider"])
+    assert np.isfinite(session.run(None, {"x": np.ones((2, 64), dtype=np.float32)})[0]).all()
+    assert {path.name: path.read_bytes() for path in inputs.iterdir()} == before
+    log = capsys.readouterr().out
+    assert leftovers and all(str(path) in log for path in leftovers)
+    assert "Publication completed; staging cleanup" in log
+    for path in leftovers:
+        cleanup(path)
