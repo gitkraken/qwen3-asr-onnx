@@ -332,6 +332,8 @@ def main():
     args = parser.parse_args()
     if tokenizer_asset_names(args.input):
         validate_tokenizer_assets(args.input)
+    if tokenizer_asset_names(args.output):
+        validate_tokenizer_assets(args.output)
 
     converted = {
         f"{stem}.onnx"
@@ -441,6 +443,9 @@ def main():
 
     if tokenizer_asset_names(args.input):
         copy_tokenizer_assets(args.input, args.output)
+
+    if tokenizer_asset_names(args.output):
+        validate_tokenizer_assets(args.output)
 
     # Update config
     config_path = os.path.join(args.output, "config.json")

@@ -37,6 +37,7 @@ from src.prompt import (
     build_prompt_ids,
     load_prompt_tokenizer,
 )
+from src.tokenizer_assets import validate_tokenizer_assets
 
 
 def load_model(model_id: str, device: str = "cpu", dtype=torch.float32):
@@ -80,7 +81,11 @@ def copy_tokenizer(model_id: str, output_dir: str):
     tokenizer = load_prompt_tokenizer(model_id)
 
     # Save tokenizer files
+    tokenizer.chat_template = tokenizer.get_chat_template()
     tokenizer.save_pretrained(output_dir)
+    stale_template = os.path.join(output_dir, "chat_template.json")
+    if os.path.isfile(stale_template):
+        os.remove(stale_template)
 
     # Remove unwanted files from save_pretrained, keep only tokenizer files
     keep_files = {"tokenizer.json", "tokenizer_config.json", "chat_template.jinja"}
@@ -93,6 +98,7 @@ def copy_tokenizer(model_id: str, output_dir: str):
         if ext in remove_extensions or f == "special_tokens_map.json":
             os.remove(path)
 
+    validate_tokenizer_assets(output_dir)
     print(f"Tokenizer saved to {output_dir}")
 
 

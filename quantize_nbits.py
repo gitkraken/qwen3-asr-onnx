@@ -269,6 +269,8 @@ def main():
     tokenizer_files = tokenizer_asset_names(args.input)
     if tokenizer_files:
         validate_tokenizer_assets(args.input)
+    if tokenizer_asset_names(args.output):
+        validate_tokenizer_assets(args.output)
 
     bits_suffix = f".int{args.bits}"
     generated_graphs = {f"{name}{bits_suffix}.onnx" for name in args.decoders}
@@ -333,6 +335,9 @@ def main():
 
     if tokenizer_files:
         copy_tokenizer_assets(args.input, args.output)
+
+    if tokenizer_asset_names(args.output):
+        validate_tokenizer_assets(args.output)
 
     # Update config.json quantization field (merge with existing for split-decoder runs)
     config_path = os.path.join(args.output, "config.json")

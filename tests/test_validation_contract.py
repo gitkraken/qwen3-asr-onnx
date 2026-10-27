@@ -75,6 +75,7 @@ validate.load_embed_tokens=lambda *a,**k:np.zeros((20,3),dtype=np.float32)
 tokenizer=SimpleNamespace(decode=lambda x,**k:str(x))
 validate.AutoTokenizer=SimpleNamespace(from_pretrained=lambda *a,**k:tokenizer)
 validate.load_prompt_tokenizer=lambda *a,**k:tokenizer
+validate.validate_tokenizer_assets=lambda *a,**k:tokenizer
 validate.build_prompt_ids=lambda *a,**k:[1,2,3]
 validate.run_encoder_pytorch=lambda *a,**k:torch.zeros(1,1,3)
 try:
@@ -252,3 +253,77 @@ def test_direct_native_tolerance_is_not_inferred_from_pairwise_passes(monkeypatc
     model = SimpleNamespace(thinker=SimpleNamespace(audio_tower=None))
     with pytest.raises(ValueError, match="native vs ONNX: encoder features exceed"):
         validate.validate_encoder(model, {"encoder": object()}, None, None, "cpu")
+
+
+@pytest.mark.parametrize("problem", ["missing", "corrupt", "conflicting-template"])
+def test_main_rejects_invalid_artifact_family_before_audio(tmp_path, monkeypatch, problem):
+    import json
+
+    from tests.tokenizer_fixtures import save_tokenizer_assets
+
+    save_tokenizer_assets(tmp_path)
+    if problem == "missing":
+        (tmp_path / "tokenizer.json").unlink()
+    elif problem == "corrupt":
+        (tmp_path / "tokenizer.json").write_text("invalid JSON")
+    else:
+        (tmp_path / "chat_template.json").write_text(json.dumps({"chat_template": "WRONG PROMPT"}))
+    monkeypatch.setattr(validate, "load_onnx_sessions", lambda path: {})
+    monkeypatch.setattr(sys, "argv", ["validate.py", "--onnx-dir", str(tmp_path), "--audio", "unused"])
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Artifact validation must precede audio and model loading")
+
+    monkeypatch.setattr(validate.sf, "read", forbidden)
+    monkeypatch.setattr(validate, "load_pytorch_model", forbidden)
+    with pytest.raises(ValueError, match="tokenizer|ASR"):
+        validate.main()
+
+
+def artifact_pair(root, *, role_id=None, word_id=86):
+    import json
+
+    from src.tokenizer_assets import validate_tokenizer_assets
+    from tests.tokenizer_fixtures import save_tokenizer_assets
+
+    checkpoint, artifact = root / "checkpoint", root / "artifact"
+    native = save_tokenizer_assets(checkpoint)
+    save_tokenizer_assets(artifact)
+    path = artifact / "tokenizer.json"
+    data = json.loads(path.read_text())
+    vocab = data["model"]["vocab"]
+    if role_id is not None:
+        vocab["system"] = role_id
+    if word_id != 86:
+        vocab["Kepler"] = word_id
+        vocab["Different"] = 86
+    path.write_text(json.dumps(data))
+    return native, validate_tokenizer_assets(artifact)
+
+
+def test_pipeline_rejects_different_artifact_prompt_before_decoding(tmp_path, monkeypatch):
+    native, artifact = artifact_pair(tmp_path, role_id=99)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Prompt identity must be checked before decoding")
+
+    monkeypatch.setattr(validate, "greedy_decode_pytorch", forbidden)
+    monkeypatch.setattr(validate, "greedy_decode_onnx", forbidden)
+    with pytest.raises(ValueError, match="Artifact prompt IDs"):
+        validate.validate_pipeline(
+            None, {}, None, torch.zeros(1, 1, 3), np.zeros((1, 1, 3)), native, "cpu", onnx_tokenizer=artifact
+        )
+
+
+@pytest.mark.parametrize("artifact_token", [86, 99])
+def test_pipeline_compares_decoded_text_with_each_actual_tokenizer(tmp_path, monkeypatch, artifact_token, capsys):
+    native, artifact = artifact_pair(tmp_path, word_id=99)
+    monkeypatch.setattr(validate, "greedy_decode_pytorch", lambda *a, **k: [86])
+    monkeypatch.setattr(validate, "greedy_decode_onnx", lambda *a, **k: [artifact_token])
+    args = (None, {}, None, torch.zeros(1, 1, 3), np.zeros((1, 1, 3)), native, "cpu")
+    if artifact_token == 86:
+        with pytest.raises(ValueError, match="Transcript mismatch"):
+            validate.validate_pipeline(*args, onnx_tokenizer=artifact)
+    else:
+        validate.validate_pipeline(*args, onnx_tokenizer=artifact)
+        assert "PASS: Text matches" in capsys.readouterr().out

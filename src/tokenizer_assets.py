@@ -1,3 +1,4 @@
+import json
 import shutil
 import tempfile
 from pathlib import Path
@@ -34,6 +35,7 @@ def validate_tokenizer_assets(root):
     try:
         tokenizer = prompt.load_prompt_tokenizer(str(root), local_files_only=True)
         _validate_prompt_tokenizer(tokenizer)
+        _validate_shipped_templates(root, tokenizer)
     except Exception as error:
         raise ValueError(f"Invalid ASR tokenizer assets in {root}: {error}") from error
     return tokenizer
@@ -67,6 +69,46 @@ def _validate_prompt_tokenizer(tokenizer) -> None:
             expected_text += f"language {language}<asr_text>"
         if actual != tokenizer.encode(expected_text, add_special_tokens=False):
             raise ValueError("Tokenizer chat template does not implement the Qwen3-ASR prompt contract")
+
+
+def _template_values(value):
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict) and value and all(isinstance(item, str) for item in value.values()):
+        return list(value.values())
+    if (
+        isinstance(value, list)
+        and value
+        and all(
+            isinstance(item, dict) and isinstance(item.get("name"), str) and isinstance(item.get("template"), str)
+            for item in value
+        )
+    ):
+        return [item["template"] for item in value]
+    raise ValueError("Chat template must be a string or a nonempty named template collection")
+
+
+def _validate_shipped_templates(root, tokenizer):
+    config = json.loads((root / "tokenizer_config.json").read_text())
+    templates = []
+    if "chat_template" in config:
+        templates.extend(_template_values(config["chat_template"]))
+    legacy = root / "chat_template.json"
+    if legacy.is_file():
+        document = json.loads(legacy.read_text())
+        if not isinstance(document, dict) or "chat_template" not in document:
+            raise ValueError("chat_template.json must contain chat_template")
+        templates.extend(_template_values(document["chat_template"]))
+    jinja = root / "chat_template.jinja"
+    if jinja.is_file():
+        templates.append(jinja.read_text())
+    selected = tokenizer.chat_template
+    try:
+        for template in templates:
+            tokenizer.chat_template = template
+            _validate_prompt_tokenizer(tokenizer)
+    finally:
+        tokenizer.chat_template = selected
 
 
 def copy_tokenizer_assets(source, target) -> None:

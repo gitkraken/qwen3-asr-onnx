@@ -98,6 +98,7 @@ def _validate_archive_target(target, archive_root, variant):
 
 def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
     source = Path(input_dir).resolve()
+    validate_tokenizer_assets(source)
     output = Path(output_dir).absolute()
     archives = {
         variant: output.parent / f"{output.name}{'-int4' if variant else ''}.tar.gz" for variant in ("", "int4")

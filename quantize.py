@@ -139,6 +139,8 @@ def main():
     args = parser.parse_args()
     if tokenizer_asset_names(args.input):
         validate_tokenizer_assets(args.input)
+    if tokenizer_asset_names(args.output):
+        validate_tokenizer_assets(args.output)
 
     suffix = f".{args.weight_type}"
     files = {
@@ -226,6 +228,9 @@ def main():
 
     if tokenizer_asset_names(args.input):
         copy_tokenizer_assets(args.input, args.output)
+
+    if tokenizer_asset_names(args.output):
+        validate_tokenizer_assets(args.output)
 
     # Update config.json quantization metadata
     config_path = os.path.join(args.output, "config.json")

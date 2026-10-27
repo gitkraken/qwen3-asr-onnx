@@ -125,9 +125,11 @@ required artifacts; inspection never extracts members or follows archive links.
 An archive for an inactive variant is preserved and causes a preflight error, so
 a successful release cannot leave an ambiguous stale variant beside it. Choose a
 clean output name or move that file aside explicitly before retrying. The shared tokenizer-asset contract
-preserves embedded/JSON/Jinja templates across conversion and archiving, removes
-stale destination template assets when the source has tokenizer assets, and requires a locally renderable ASR prompt
-before a package can be published. Tokenizer assets are validated together in staging,
+validates every transported embedded/JSON/root Jinja template representation across
+conversion and archiving. Export normalizes the selected ASR template to Jinja and
+removes stale legacy JSON. Converters reject conflicting existing tokenizer outputs
+before conversion and validate their resulting prompt metadata before reporting
+success. A locally renderable ASR prompt is required before packaging. Tokenizer assets are validated together in staging,
 and publication exceptions trigger rollback of their previous set. A failed rollback
 reports the preserved backup path. This does not make an entire
 converter invocation transactional. An archive or validation failure is a failed
@@ -196,7 +198,9 @@ absolute and relative errors, runtime versions and checkpoint identities.
 The validator uses the official native encoder independently of the exported
 wrapper, checks shapes and finite values, defaults to the existing absolute 1e-4
 encoder threshold directly between native and ONNX as well as both intermediate comparisons, and fails on unacceptable transcript divergence or missing
-sessions. Explicit CLI tolerance flags select a different finite comparison budget.
+sessions. Checkpoint and artifact tokenizers are loaded independently; prompt IDs
+must match and each output is decoded with its own tokenizer before comparing
+text, including when token IDs match. Explicit CLI tolerance flags select a different finite comparison budget.
 Wrapper-to-ONNX parity remains a separate check. Prompts use the official
 checkpoint chat template and tokenizer for roles, context and forced language.
 Check both original checkpoint tokenizers, including system=8948/user=872 and the

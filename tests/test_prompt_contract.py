@@ -145,10 +145,9 @@ def test_loads_official_processor_template_when_tokenizer_has_none(tmp_path, mon
 
 def test_exported_tokenizer_retains_official_template(tmp_path, monkeypatch):
     import export
+    from tests.tokenizer_fixtures import save_tokenizer_assets
 
-    raw = Tokenizer(models.WordLevel({"[UNK]": 0, "word": 1}, unk_token="[UNK]"))
-    tokenizer = PreTrainedTokenizerFast(tokenizer_object=raw, unk_token="[UNK]")
-    tokenizer.chat_template = OFFICIAL_CHAT_TEMPLATE
+    tokenizer = save_tokenizer_assets(tmp_path / "source")
     monkeypatch.setattr(export, "load_prompt_tokenizer", lambda model: tokenizer)
     export.copy_tokenizer("fixture", str(tmp_path))
     assert (tmp_path / "chat_template.jinja").is_file()
@@ -167,3 +166,16 @@ def test_missing_official_template_fails_with_actionable_error(monkeypatch):
     monkeypatch.setattr(transformers.utils, "cached_file", lambda *args, **kwargs: None)
     with pytest.raises(ValueError, match="Missing official chat_template.json"):
         prompt.load_prompt_tokenizer("fixture")
+
+
+def test_export_rejects_selected_template_that_discards_context(tmp_path):
+    import export
+    from tests.tokenizer_fixtures import save_tokenizer_assets
+
+    source, target = tmp_path / "source", tmp_path / "target"
+    save_tokenizer_assets(source)
+    path = source / "chat_template.jinja"
+    path.write_text(path.read_text().replace("ns.system_text if ns.system_text is string else ''", "''"))
+    export.verify_special_tokens(str(source))
+    with pytest.raises(ValueError, match="Invalid ASR tokenizer assets"):
+        export.copy_tokenizer(str(source), str(target))

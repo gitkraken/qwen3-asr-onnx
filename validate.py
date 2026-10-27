@@ -28,6 +28,7 @@ from src.prompt import (
     get_audio_pad_range,
     load_prompt_tokenizer,
 )
+from src.tokenizer_assets import validate_tokenizer_assets
 
 
 def load_pytorch_model(model_id: str, device: str = "cpu"):
@@ -220,7 +221,15 @@ def validate_encoder(model, sessions, mel_np, mel_torch, device, *, atol=1e-4, r
 
 
 def validate_pipeline(
-    model, sessions, embed_tokens, audio_features_pt, audio_features_onnx, tokenizer, device, max_tokens=256
+    model,
+    sessions,
+    embed_tokens,
+    audio_features_pt,
+    audio_features_onnx,
+    tokenizer,
+    device,
+    max_tokens=256,
+    onnx_tokenizer=None,
 ):
     """Compare full pipeline (encode -> decode) between PyTorch and ONNX."""
     print("\n=== Pipeline Validation ===")
@@ -228,6 +237,10 @@ def validate_pipeline(
     # Build prompt
     audio_token_count = audio_features_pt.shape[1]
     prompt_ids = build_prompt_ids(audio_token_count, tokenizer)
+    artifact_tokenizer = tokenizer if onnx_tokenizer is None else onnx_tokenizer
+    artifact_prompt = build_prompt_ids(audio_token_count, artifact_tokenizer)
+    if artifact_prompt != prompt_ids:
+        raise ValueError("Artifact prompt IDs do not match the checkpoint")
     print(f"  Prompt length: {len(prompt_ids)} tokens ({audio_token_count} audio tokens)")
 
     # PyTorch decode
@@ -239,12 +252,14 @@ def validate_pipeline(
     # ONNX decode
     print("  Running ONNX decode...")
     t0 = time.time()
-    onnx_tokens = greedy_decode_onnx(sessions, embed_tokens, audio_features_onnx, prompt_ids, max_tokens=max_tokens)
+    onnx_tokens = greedy_decode_onnx(
+        sessions, embed_tokens, audio_features_onnx, artifact_prompt, max_tokens=max_tokens
+    )
     onnx_time = time.time() - t0
 
     # Decode to text
     pt_text = tokenizer.decode(pt_tokens, skip_special_tokens=True)
-    onnx_text = tokenizer.decode(onnx_tokens, skip_special_tokens=True)
+    onnx_text = artifact_tokenizer.decode(onnx_tokens, skip_special_tokens=True)
 
     print(f"\n  PyTorch text ({len(pt_tokens)} tokens, {pt_time:.2f}s):")
     print(f"    {pt_text}")
@@ -256,12 +271,12 @@ def validate_pipeline(
     total = max(len(pt_tokens), len(onnx_tokens))
     print(f"\n  Token match: {match_count}/{total}")
 
+    if pt_text != onnx_text:
+        raise ValueError(f"Transcript mismatch: PyTorch={pt_text!r}, ONNX={onnx_text!r}")
     if pt_tokens == onnx_tokens:
         print("  PASS: Exact token-for-token match")
-    elif pt_text == onnx_text:
-        print("  PASS: Text matches (minor token differences)")
     else:
-        raise ValueError(f"Transcript mismatch: PyTorch={pt_text!r}, ONNX={onnx_text!r}")
+        print("  PASS: Text matches (minor token differences)")
 
 
 def main():
@@ -281,6 +296,7 @@ def main():
 
     print("\nLoading ONNX sessions...")
     sessions = load_onnx_sessions(args.onnx_dir)
+    artifact_tokenizer = validate_tokenizer_assets(args.onnx_dir)
 
     # Load audio
     print("Loading audio...")
@@ -327,6 +343,7 @@ def main():
         tokenizer,
         args.device,
         max_tokens=args.max_tokens,
+        onnx_tokenizer=artifact_tokenizer,
     )
 
 

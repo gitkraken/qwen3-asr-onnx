@@ -154,7 +154,7 @@ def test_converter_cli_transports_complete_tokenizer(tmp_path, script, template_
     source = _source(tmp_path / "source", template_format)
     target = tmp_path / "target"
     save_tokenizer_assets(target, template_format="jinja")
-    (target / "chat_template.jinja").write_text("obsolete template")
+    (target / "chat_template.jinja").write_text("{# existing template #}" + OFFICIAL_CHAT_TEMPLATE)
     command = _converter_command(tmp_path, script, source, target)
     result = subprocess.run(
         command,
@@ -333,7 +333,7 @@ def test_quantizer_cli_preserves_retained_tokenizer_links(tmp_path, script, link
     before = {}
     for name in tokenizer_asset_names(source):
         previous = retained / name
-        previous.write_bytes(("retained-" + name).encode())
+        previous.write_bytes(b"\n" + (source / name).read_bytes())
         before[name] = previous.read_bytes()
         if link == "symlink":
             (target / name).symlink_to(previous)

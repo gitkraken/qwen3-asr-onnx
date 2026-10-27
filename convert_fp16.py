@@ -84,6 +84,8 @@ def main():
     args = parser.parse_args()
     if tokenizer_asset_names(args.input):
         validate_tokenizer_assets(args.input)
+    if tokenizer_asset_names(args.output):
+        validate_tokenizer_assets(args.output)
 
     converted = {name for name in args.files if os.path.isfile(os.path.join(args.input, name))}
     generated = converted | {f"{name}.data" for name in converted}
@@ -125,6 +127,9 @@ def main():
 
     if tokenizer_asset_names(args.input):
         copy_tokenizer_assets(args.input, args.output)
+
+    if tokenizer_asset_names(args.output):
+        validate_tokenizer_assets(args.output)
 
     # Update config
     config_path = os.path.join(args.output, "config.json")
