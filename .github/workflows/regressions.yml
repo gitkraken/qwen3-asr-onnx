@@ -6,6 +6,15 @@ permissions:
   contents: read
 
 jobs:
+  source-access-windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.13"
+      - run: python -m unittest tests.test_source_access -v
+
   regression:
     runs-on: macos-15
     env:

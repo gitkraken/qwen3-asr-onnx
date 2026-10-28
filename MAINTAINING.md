@@ -163,6 +163,14 @@ returning, so calibration and evaluation inherit the same prompt contract. Famil
 validation additionally checks every shipped template representation. Kepler continues
 using its own manifest-driven publisher.
 
+Source-preservation checks track the actual paths used to read metadata, embeddings
+and graph storage, including intermediate symlinks. They distinguish replacing a
+directory entry from modifying the inode behind another hardlink. Protected source
+access paths containing Windows junctions are refused before publication; ordinary
+safe symlinks remain supported. A separate Windows CI job exercises this filesystem
+guard with real junctions using only the Python standard library. It does not
+establish support for the full exporter or numerical pipeline on Windows.
+
 ## Calibration cache provenance
 
 Static calibration and AWQ use numeric NPZ caches with one versioned provenance
