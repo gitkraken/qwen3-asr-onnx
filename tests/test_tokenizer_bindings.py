@@ -1,8 +1,10 @@
 import builtins
+import errno
 import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -11,8 +13,9 @@ import export
 import package as pack
 from src.prompt import load_prompt_tokenizer
 from src.tokenizer_assets import copy_tokenizer_assets, validate_tokenizer_assets
-from tests.converter_fixtures import ROOT, _converter_command, _source
-from tests.tokenizer_fixtures import save_tokenizer_assets
+from tests.artifact_fixtures import _write_external_identity
+from tests.converter_fixtures import ROOT, _converter_command, _source, command, input_for
+from tests.tokenizer_fixtures import OFFICIAL_CHAT_TEMPLATE, save_tokenizer_assets
 
 
 def _configure(root, **values):
@@ -235,3 +238,180 @@ def test_canonical_family_same_directory_remains_a_noop(tmp_path):
     before = _snapshot(tmp_path)
     copy_tokenizer_assets(tmp_path, tmp_path)
     assert _snapshot(tmp_path) == before
+
+
+def _infer_class_from_model_config(source):
+    config_path = source / "tokenizer_config.json"
+    config = json.loads(config_path.read_text())
+    config.pop("tokenizer_class")
+    config_path.write_text(json.dumps(config))
+    model_path = source / "config.json"
+    model = json.loads(model_path.read_text()) if model_path.exists() else {}
+    model["model_type"] = "qwen2"
+    model_path.write_text(json.dumps(model))
+    return validate_tokenizer_assets(source)
+
+
+@pytest.mark.parametrize("template_format", ["jinja", "json", "embedded", "named"])
+@pytest.mark.parametrize("special_map", [False, True])
+def test_model_inferred_family_is_portable_without_changing_model_metadata(tmp_path, template_format, special_map):
+    source, target = tmp_path / "source", tmp_path / "target"
+    save_tokenizer_assets(source, template_format="embedded" if template_format == "named" else template_format)
+    if template_format == "named":
+        _configure(source, chat_template={"default": OFFICIAL_CHAT_TEMPLATE, "alternate": OFFICIAL_CHAT_TEMPLATE})
+    if not special_map:
+        (source / "special_tokens_map.json").unlink()
+    expected = _infer_class_from_model_config(source)
+    before_source = _snapshot(source)
+    target.mkdir()
+    model_path = target / "config.json"
+    model_path.write_text('{"model_type": "bert", "runtime_owner": "retained"}')
+    before_model = model_path.read_bytes()
+    copy_tokenizer_assets(source, target)
+    assert _snapshot(source) == before_source
+    assert model_path.read_bytes() == before_model
+    actual = validate_tokenizer_assets(target)
+    assert type(actual) is type(expected)
+    assert actual.get_vocab() == expected.get_vocab()
+    assert actual.encode("Kepler") == expected.encode("Kepler")
+    assert actual.chat_template == expected.chat_template
+    assert json.loads((target / "tokenizer_config.json").read_text())["origin_marker"] == "tiny-local-fixture"
+    model_path.unlink()
+    assert validate_tokenizer_assets(target).get_vocab() == expected.get_vocab()
+
+
+@pytest.mark.parametrize("script", ["convert_fp16.py", "quantize_static.py", "quantize.py", "quantize_nbits.py"])
+@pytest.mark.parametrize("storage", ["incoming", "retained"])
+def test_prepared_family_conflicts_fail_before_converter_writes(tmp_path, script, storage):
+    source = input_for(tmp_path, script)
+    _infer_class_from_model_config(source)
+    target = tmp_path / "target"
+    target.mkdir()
+    if storage == "incoming":
+        _write_external_identity(source, "encoder.onnx", "tokenizer_config.json")
+    else:
+        (target / "tokenizer_config.json").write_bytes((source / "tokenizer_config.json").read_bytes())
+        _write_external_identity(target, "aux.onnx", "tokenizer_config.json")
+    before_source, before_target = _snapshot(source), _snapshot(target)
+    arguments = command(tmp_path, script, source, target)
+    if script == "convert_fp16.py":
+        arguments += ["--files", "decoder_init.onnx", "decoder_step.onnx"]
+    result = subprocess.run(
+        arguments,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=os.environ | {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
+    )
+    assert result.returncode != 0
+    assert _snapshot(source) == before_source
+    assert _snapshot(target) == before_target
+    assert "destination conflict" in result.stdout + result.stderr
+
+
+def test_normalized_family_can_reuse_identical_retained_storage(tmp_path):
+    source, target = tmp_path / "source", tmp_path / "target"
+    save_tokenizer_assets(source)
+    expected = _infer_class_from_model_config(source)
+    copy_tokenizer_assets(source, target)
+    _write_external_identity(target, "aux.onnx", "tokenizer_config.json")
+    before = _snapshot(target)
+    copy_tokenizer_assets(source, target)
+    assert _snapshot(target) == before
+    assert validate_tokenizer_assets(target).get_vocab() == expected.get_vocab()
+
+
+def test_model_inferred_family_same_directory_remains_a_noop(tmp_path):
+    save_tokenizer_assets(tmp_path)
+    _infer_class_from_model_config(tmp_path)
+    before = _snapshot(tmp_path)
+    copy_tokenizer_assets(tmp_path, tmp_path)
+    assert _snapshot(tmp_path) == before
+
+
+def test_family_copy_does_not_validate_unselected_source_graphs(tmp_path):
+    source, target = tmp_path / "source", tmp_path / "target"
+    save_tokenizer_assets(source)
+    _write_external_identity(source, "unrelated.onnx", "missing.data")
+    copy_tokenizer_assets(source, target)
+    validate_tokenizer_assets(target)
+    assert not (target / "unrelated.onnx").exists()
+
+
+def test_staging_directory_name_cannot_supply_published_tokenizer_class(tmp_path, monkeypatch):
+    source, target = tmp_path / "source", tmp_path / "target"
+    save_tokenizer_assets(source)
+    expected = _infer_class_from_model_config(source)
+    staging_root = tmp_path / "qwen2-staging"
+    staging_root.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(staging_root))
+    copy_tokenizer_assets(source, target)
+    config = json.loads((target / "tokenizer_config.json").read_text())
+    assert config["tokenizer_class"]
+    assert validate_tokenizer_assets(target).get_vocab() == expected.get_vocab()
+
+
+def test_family_publication_uses_destination_filesystem(tmp_path, monkeypatch):
+    source, target = tmp_path / "source", tmp_path / "target"
+    save_tokenizer_assets(source)
+    save_tokenizer_assets(target, "json")
+    replace = os.replace
+
+    def same_volume_replace(original, destination):
+        if Path(destination).is_relative_to(target) and not Path(original).is_relative_to(target):
+            raise OSError(errno.EXDEV, "cross-device link")
+        return replace(original, destination)
+
+    monkeypatch.setattr(os, "replace", same_volume_replace)
+    copy_tokenizer_assets(source, target)
+    assert validate_tokenizer_assets(target).get_vocab() == validate_tokenizer_assets(source).get_vocab()
+
+
+def _deferred_backend_source(source, source_applies):
+    from tokenizers import pre_tokenizers
+
+    save_tokenizer_assets(source)
+    path = source / "tokenizer.json"
+    document = json.loads(path.read_text())
+    document["model"]["vocab"].update({f"word_{index}": index + 200 for index in range(100001)})
+    document["pre_tokenizer"] = json.loads(pre_tokenizers.Sequence([pre_tokenizers.WhitespaceSplit()]).__getstate__())
+    path.write_text(json.dumps(document))
+    _configure(source, fix_mistral_regex=True)
+    model = {"model_type": "qwen2"}
+    if not source_applies:
+        model["transformers_version"] = "4.57.2"
+    (source / "config.json").write_text(json.dumps(model))
+    return validate_tokenizer_assets(source)
+
+
+@pytest.mark.parametrize("source_applies", [False, True])
+def test_destination_model_config_cannot_activate_deferred_backend_change(tmp_path, source_applies):
+    source, target = tmp_path / "source", tmp_path / "target"
+    expected = _deferred_backend_source(source, source_applies)
+    before_source = _snapshot(source)
+    target.mkdir()
+    model_config = target / "config.json"
+    model_config.write_text('{"model_type": "qwen2"}')
+    before_model = model_config.read_bytes()
+    copy_tokenizer_assets(source, target)
+    actual = validate_tokenizer_assets(target)
+    assert actual.get_vocab() == expected.get_vocab()
+    assert actual.encode("Kepler") == expected.encode("Kepler")
+    assert json.loads(actual.backend_tokenizer.to_str()) == json.loads(expected.backend_tokenizer.to_str())
+    assert _snapshot(source) == before_source
+    assert model_config.read_bytes() == before_model
+    model_config.unlink()
+    assert validate_tokenizer_assets(target).get_vocab() == expected.get_vocab()
+
+
+def test_export_can_reuse_normalized_retained_tokenizer_storage(tmp_path):
+    source, target = tmp_path / "source", tmp_path / "target"
+    expected = _deferred_backend_source(source, False)
+    export.copy_tokenizer(str(source), str(target))
+    _write_external_identity(target, "aux.onnx", "tokenizer_config.json")
+    before_source, before_target = _snapshot(source), _snapshot(target)
+    export.copy_tokenizer(str(source), str(target))
+    assert _snapshot(source) == before_source
+    assert _snapshot(target) == before_target
+    actual = validate_tokenizer_assets(target)
+    assert json.loads(actual.backend_tokenizer.to_str()) == json.loads(expected.backend_tokenizer.to_str())

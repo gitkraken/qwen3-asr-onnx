@@ -141,6 +141,7 @@ def preflight_artifact_mutations(
     read_files=(),
     existing=None,
     copied_assets=(),
+    asset_source=None,
 ):
     source_root = Path(source).absolute()
     destination_root = Path(output).absolute()
@@ -148,7 +149,13 @@ def preflight_artifact_mutations(
     generated, rewritten, removed = set(generated), set(rewritten), set(removed)
     validate_generated_destinations(destination_root, generated)
     assets = set(copied_assets)
-    files = {name for name in set(copies) | assets if (source / name).is_file()} if source != output else set()
+    asset_root = source if asset_source is None else Path(asset_source)
+    files = (
+        {name for name in copies if (source / name).is_file()}
+        | {name for name in assets if (asset_root / name).is_file()}
+        if source != output
+        else set()
+    )
     incoming = inventory_graphs(source, set(generated) - set(reads) if source == output else ())
     copied_graphs = files & incoming.keys()
     dependencies = set().union(*(incoming[name] for name in copied_graphs))
@@ -176,6 +183,9 @@ def preflight_artifact_mutations(
             files=(destination_root / name for name in source_mutations),
         )
     conflicts = (files & generated) | (dependencies & (rewritten | removed))
+    for name in dependencies & assets:
+        if file_digest(source / name) != file_digest(asset_root / name):
+            conflicts.add(name)
     if source == output:
         read_dependencies = set().union(*(incoming[name] for name in reads if name in incoming))
         conflicts.update(read_dependencies & (generated | rewritten | removed))
@@ -191,7 +201,7 @@ def preflight_artifact_mutations(
     reserved = set(surviving) | set().union(*(existing[name] for name in surviving))
     conflicts = reserved & (generated | rewritten | removed)
     for name in files & reserved:
-        original, retained = source / name, output / name
+        original, retained = (asset_root if name in assets else source) / name, output / name
         if original.stat().st_size == retained.stat().st_size and file_digest(original) == file_digest(retained):
             files.remove(name)
         else:

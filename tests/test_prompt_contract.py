@@ -182,13 +182,13 @@ def test_loads_official_processor_template_when_tokenizer_has_none(tmp_path, mon
     assert requests == [("fixture", "chat_template.json")]
 
 
-def test_exported_tokenizer_retains_official_template(tmp_path, monkeypatch):
+def test_exported_tokenizer_retains_official_template(tmp_path):
     import export
     from tests.tokenizer_fixtures import save_tokenizer_assets
 
-    tokenizer = save_tokenizer_assets(tmp_path / "source")
-    monkeypatch.setattr(export, "load_prompt_tokenizer", lambda model: tokenizer)
-    export.copy_tokenizer("fixture", str(tmp_path))
+    source = tmp_path / "source"
+    save_tokenizer_assets(source)
+    export.copy_tokenizer(str(source), str(tmp_path))
     assert (tmp_path / "chat_template.jinja").is_file()
     assert prompt.load_prompt_tokenizer(str(tmp_path)).chat_template == OFFICIAL_CHAT_TEMPLATE
 

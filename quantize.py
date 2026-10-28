@@ -31,10 +31,7 @@ from src.onnx_artifacts import (
 )
 from src.tokenizer_assets import (
     TOKENIZER_FILES,
-    copy_tokenizer_assets,
-    tokenizer_asset_names,
-    validate_tokenizer_assets,
-    validate_tokenizer_destination,
+    prepare_tokenizer_assets,
 )
 
 ONNX_FILES = ["encoder.onnx", "decoder_init.onnx", "decoder_step.onnx"]
@@ -133,10 +130,11 @@ def main():
         help="Quantization weight type (default: int8)",
     )
     args = parser.parse_args()
-    if tokenizer_asset_names(args.input):
-        validate_tokenizer_assets(args.input)
-    validate_tokenizer_destination(args.output)
+    with prepare_tokenizer_assets(args.input, args.output) as tokenizer:
+        _run_conversion(args, tokenizer)
 
+
+def _run_conversion(args, tokenizer):
     suffix = f".{args.weight_type}"
     files = {
         fname
@@ -151,16 +149,17 @@ def main():
     generated = generated_graphs | {f"{name}.data" for name in generated_graphs}
     retained_graphs, previous_quantization = retained_quantization(args.output, suffix, generated_graphs)
     files.discard("config.json")
-    tokenizer_files = tokenizer_asset_names(args.input)
+    tokenizer_files = tokenizer.names if tokenizer else frozenset()
     files = preflight_artifact_mutations(
         args.input,
         args.output,
         files,
         generated=generated,
         rewritten={"config.json"},
-        read_files={"config.json"},
+        read_files={"config.json"} | (tokenizer.read_files if tokenizer else set()),
         copied_assets=tokenizer_files,
-        removed=TOKENIZER_FILES - tokenizer_files if tokenizer_files else (),
+        asset_source=tokenizer.root if tokenizer else None,
+        removed=tokenizer.removed if tokenizer else (),
         reads=ONNX_FILES,
     )
     os.makedirs(args.output, exist_ok=True)
@@ -224,8 +223,8 @@ def main():
             copy_artifact_entry(args.input, args.output, fname)
             print(f"  Copied {fname}")
 
-    if tokenizer_asset_names(args.input):
-        copy_tokenizer_assets(args.input, args.output)
+    if tokenizer:
+        tokenizer.publish(written_files=files | generated)
 
     config_path = Path(args.input) / "config.json"
     if not config_path.is_file():

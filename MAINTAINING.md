@@ -143,10 +143,16 @@ An archive for an inactive variant is preserved and causes a preflight error, so
 a successful release cannot leave an ambiguous stale variant beside it. Choose a
 clean output name or move that file aside explicitly before retrying. The shared tokenizer-asset contract
 validates every transported embedded/JSON/root Jinja template representation across
-conversion and archiving. Export normalizes the selected ASR template to Jinja and
-removes stale legacy JSON. Converters validate supplied tokenizer metadata as a
-family and publish replacements atomically, allowing stale root templates to be
-repaired. Unsupported additional template directories are refused before writes. A locally renderable ASR prompt is required before packaging. Tokenizer assets are validated together in staging,
+conversion and archiving. Export keeps the selected ASR template in a self-contained
+family and removes stale legacy representations. Converters prepare an independent
+family before graph work. Families whose model configuration affects their reader
+are serialized with the resolved class, backend, settings and named templates;
+deferred regex changes are disabled after the actual backend is materialized.
+Conflict checks compare those prepared bytes with incoming and retained graph
+storage, allowing identical bytes to be reused. Late publication preserves the
+initial distinction between newly written graphs and independent retained graphs.
+Family replacements use destination-local staging and atomic publication,
+allowing stale root templates to be repaired. Unsupported additional template directories are refused before writes. A locally renderable ASR prompt is required before packaging. Tokenizer assets are validated together in staging,
 and publication exceptions trigger rollback of their previous set. A failed rollback
 reports the preserved backup path. Operating-system cleanup errors after a
 completed publication report the leftover path and completed state; a primary

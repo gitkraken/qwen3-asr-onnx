@@ -28,7 +28,7 @@ from src.artifact_publication import ArtifactStaging
 from src.artifact_sources import validate_publication_sources
 from src.decoder_wrapper import export_decoder_init, export_decoder_step
 from src.encoder_wrapper import export_encoder
-from src.onnx_artifacts import external_data_files, preflight_artifact_mutations
+from src.onnx_artifacts import external_data_files
 from src.prompt import (
     ASR_TEXT_TOKEN_ID,
     AUDIO_END_TOKEN_ID,
@@ -44,7 +44,6 @@ from src.prompt import (
 from src.tokenizer_assets import (
     TOKENIZER_FILES,
     copy_tokenizer_assets,
-    tokenizer_asset_names,
     tokenizer_checkpoint_reads,
     validate_tokenizer_assets,
     validate_tokenizer_destination,
@@ -98,14 +97,6 @@ def copy_tokenizer(model_id: str, output_dir: str):
     with ArtifactStaging(prefix="qwen-tokenizer-export-", dir=None) as staging:
         tokenizer.save_pretrained(staging.path)
         validate_tokenizer_assets(staging.path)
-        names = tokenizer_asset_names(staging.path)
-        preflight_artifact_mutations(
-            staging.path,
-            output_dir,
-            (),
-            copied_assets=names,
-            removed=TOKENIZER_FILES - names,
-        )
         copy_tokenizer_assets(staging.path, output_dir)
         staging.mark_complete()
     print(f"Tokenizer saved to {output_dir}")

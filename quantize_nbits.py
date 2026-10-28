@@ -61,10 +61,7 @@ from src.onnx_artifacts import (
 )
 from src.tokenizer_assets import (
     TOKENIZER_FILES,
-    copy_tokenizer_assets,
-    tokenizer_asset_names,
-    validate_tokenizer_assets,
-    validate_tokenizer_destination,
+    prepare_tokenizer_assets,
 )
 
 
@@ -265,11 +262,12 @@ def main():
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Required decoder not found: {path}")
 
-    tokenizer_files = tokenizer_asset_names(args.input)
-    if tokenizer_files:
-        validate_tokenizer_assets(args.input)
-    validate_tokenizer_destination(args.output)
+    with prepare_tokenizer_assets(args.input, args.output) as tokenizer:
+        _run_conversion(args, tokenizer)
 
+
+def _run_conversion(args, tokenizer):
+    tokenizer_files = tokenizer.names if tokenizer else frozenset()
     bits_suffix = f".int{args.bits}"
     generated_graphs = {f"{name}{bits_suffix}.onnx" for name in args.decoders}
     validate_generated_destinations(args.output, generated_graphs | {f"{name}.data" for name in generated_graphs})
@@ -296,9 +294,10 @@ def main():
         files,
         generated=generated,
         rewritten={"config.json"},
-        read_files={"config.json"},
+        read_files={"config.json"} | (tokenizer.read_files if tokenizer else set()),
         copied_assets=tokenizer_files,
-        removed=TOKENIZER_FILES - tokenizer_files if tokenizer_files else (),
+        asset_source=tokenizer.root if tokenizer else None,
+        removed=tokenizer.removed if tokenizer else (),
         reads=[f"{name}.onnx" for name in args.decoders],
         existing=existing_graphs,
     )
@@ -321,8 +320,8 @@ def main():
             copy_artifact_entry(args.input, args.output, fname)
             print(f"  Copied {fname}")
 
-    if tokenizer_files:
-        copy_tokenizer_assets(args.input, args.output)
+    if tokenizer:
+        tokenizer.publish(written_files=files | generated)
 
     # Update config.json quantization field (merge with existing for split-decoder runs)
     config_path = os.path.join(args.input, "config.json")

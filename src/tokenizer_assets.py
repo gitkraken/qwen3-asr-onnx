@@ -1,11 +1,14 @@
 import json
 import shutil
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from src import prompt
 from src.artifact_publication import ArtifactStaging, publish_artifacts
 from src.artifact_sources import validate_publication_sources
-from src.prompt import validate_prompt_tokenizer
+from src.onnx_artifacts import inventory_graphs, preflight_artifact_mutations
+from src.prompt import tokenizer_fingerprint, validate_prompt_tokenizer
 
 TOKENIZER_FILES = frozenset(
     {
@@ -19,6 +22,7 @@ TOKENIZER_FILES = frozenset(
         "chat_template.json",
     }
 )
+CANONICAL_TOKENIZER_FILES = frozenset({"tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"})
 
 
 def tokenizer_asset_names(root) -> set[str]:
@@ -145,29 +149,102 @@ def _validate_shipped_templates(root, tokenizer):
         tokenizer.chat_template = selected
 
 
-def copy_tokenizer_assets(source, target) -> None:
+@dataclass(frozen=True)
+class PreparedTokenizerAssets:
+    source: Path
+    target: Path
+    root: Path
+    names: frozenset[str]
+    reads: frozenset[Path]
+    noop: bool = False
+
+    @property
+    def read_files(self):
+        return {str(path.relative_to(self.source)) for path in self.reads}
+
+    @property
+    def removed(self):
+        return frozenset() if self.noop else TOKENIZER_FILES - self.names
+
+    def publish(self, *, written_files=()):
+        if self.noop:
+            return
+        preflight_artifact_mutations(
+            self.root,
+            self.target,
+            (),
+            copied_assets=self.names,
+            removed=self.removed,
+            existing=inventory_graphs(self.target, written_files) if self.target.is_dir() else {},
+        )
+        validate_publication_sources(self.reads, files=(self.target / name for name in TOKENIZER_FILES))
+        self.target.mkdir(parents=True, exist_ok=True)
+        with ArtifactStaging(prefix=".tokenizer-", dir=self.target) as publication:
+            for name in self.names:
+                shutil.copyfile(self.root / name, publication.path / name)
+            publish_artifacts(
+                [(publication.path / name, self.target / name) for name in sorted(self.names)],
+                [self.target / name for name in sorted(self.removed)],
+            )
+            publication.mark_complete()
+
+
+def _same_tokenizer(first, second):
+    return tokenizer_fingerprint(first) == tokenizer_fingerprint(second) and first.chat_template == second.chat_template
+
+
+@contextmanager
+def prepare_tokenizer_assets(source, target):
     source, target = Path(source), Path(target)
-    tokenizer = validate_tokenizer_assets(source)
     validate_tokenizer_destination(target)
-    if source.resolve() == target.resolve():
+    if not tokenizer_asset_names(source):
+        yield None
         return
-    names = tokenizer_asset_names(source)
+    tokenizer = validate_tokenizer_assets(source)
+    reads = frozenset(_tokenizer_source_reads(source, tokenizer))
+    if source.resolve() == target.resolve():
+        yield PreparedTokenizerAssets(source, target, source, frozenset(tokenizer_asset_names(source)), reads, True)
+        return
     validate_publication_sources(
-        _tokenizer_source_reads(source, tokenizer),
+        reads,
         files=(target / name for name in TOKENIZER_FILES),
     )
-    target.mkdir(parents=True, exist_ok=True)
-    for name in TOKENIZER_FILES:
-        if (target / name).is_dir():
-            raise ValueError(f"Tokenizer asset destination is a directory: {target / name}")
-    # Existing metadata may link to a retained release; never write through those links.
-    with ArtifactStaging(prefix=".tokenizer-", dir=target) as staging:
-        stage = staging.path
-        for name in sorted(names):
-            shutil.copy2(source / name, stage / name)
-        validate_tokenizer_assets(stage)
-        publish_artifacts(
-            [(stage / name, target / name) for name in sorted(names)],
-            [target / name for name in sorted(TOKENIZER_FILES - names)],
-        )
+    with ArtifactStaging(prefix=".tokenizer-", dir=None) as staging:
+        copied = staging.path / "copied"
+        copied.mkdir()
+        names = frozenset(tokenizer_asset_names(source))
+        for name in names:
+            shutil.copyfile(source / name, copied / name)
+        try:
+            config = json.loads((copied / "tokenizer_config.json").read_text())
+            independent = (
+                bool(config.get("tokenizer_class"))
+                and not config.get("fix_mistral_regex")
+                and _same_tokenizer(tokenizer, validate_tokenizer_assets(copied))
+            )
+        except ValueError:
+            independent = False
+        prepared = copied
+        if not independent:
+            prepared = staging.path / "canonical"
+            tokenizer.save_pretrained(prepared, legacy_format=False, save_jinja_files=False)
+            if {path.name for path in prepared.iterdir()} != CANONICAL_TOKENIZER_FILES:
+                raise ValueError("Unsupported serialized tokenizer family")
+            config_path = prepared / "tokenizer_config.json"
+            config = json.loads(config_path.read_text())
+            # The serialized backend already contains the source-selected regex behavior.
+            config["fix_mistral_regex"] = False
+            config_path.write_text(json.dumps(config, indent=2) + "\n")
+            if not _same_tokenizer(tokenizer, validate_tokenizer_assets(prepared)):
+                raise ValueError("Serialized tokenizer family changes tokenizer identity")
+            names = CANONICAL_TOKENIZER_FILES
+        yield PreparedTokenizerAssets(source, target, prepared, names, reads)
         staging.mark_complete()
+
+
+def copy_tokenizer_assets(source, target) -> None:
+    with prepare_tokenizer_assets(source, target) as prepared:
+        if prepared is None:
+            validate_tokenizer_assets(source)
+        else:
+            prepared.publish()

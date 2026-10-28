@@ -58,11 +58,8 @@ from src.onnx_artifacts import (
     write_artifact_json,
 )
 from src.tokenizer_assets import (
-    TOKENIZER_FILES,
-    copy_tokenizer_assets,
+    prepare_tokenizer_assets,
     tokenizer_asset_names,
-    validate_tokenizer_assets,
-    validate_tokenizer_destination,
 )
 
 # ---------------------------------------------------------------------------
@@ -358,10 +355,11 @@ def main():
         help="Directory for provenance-checked numeric calibration caches (.npz)",
     )
     args = parser.parse_args()
-    if tokenizer_asset_names(args.input):
-        validate_tokenizer_assets(args.input)
-    validate_tokenizer_destination(args.output)
+    with prepare_tokenizer_assets(args.input, args.output) as tokenizer:
+        _run_conversion(args, tokenizer)
 
+
+def _run_conversion(args, tokenizer):
     converted = {
         f"{stem}.onnx"
         for stem in ("decoder_init", "decoder_step")
@@ -374,7 +372,7 @@ def main():
     files = {"embed_tokens.bin", *MODEL_METADATA_FILES}
     if os.path.isfile(os.path.join(args.input, "encoder.onnx")):
         files.add("encoder.onnx")
-    tokenizer_files = tokenizer_asset_names(args.input)
+    tokenizer_files = tokenizer.names if tokenizer else frozenset()
     files.difference_update(tokenizer_files)
     files = preflight_artifact_mutations(
         args.input,
@@ -382,8 +380,10 @@ def main():
         files,
         generated=generated,
         rewritten={"config.json"},
+        read_files=tokenizer.read_files if tokenizer else (),
         copied_assets=tokenizer_files,
-        removed=TOKENIZER_FILES - tokenizer_files if tokenizer_files else (),
+        asset_source=tokenizer.root if tokenizer else None,
+        removed=tokenizer.removed if tokenizer else (),
         reads=converted,
     )
     os.makedirs(args.output, exist_ok=True)
@@ -461,8 +461,8 @@ def main():
             copy_artifact_entry(args.input, args.output, filename)
             print(f"  Copied {filename}")
 
-    if tokenizer_asset_names(args.input):
-        copy_tokenizer_assets(args.input, args.output)
+    if tokenizer:
+        tokenizer.publish(written_files=files | generated)
 
     # Update config
     config_path = os.path.join(args.output, "config.json")

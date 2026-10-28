@@ -9,6 +9,7 @@ import pytest
 import quantize as dynamic
 import quantize_static as static
 from src import onnx_artifacts
+from src.tokenizer_assets import PreparedTokenizerAssets
 from tests.artifact_fixtures import _ort_result, _write_external_identity, _write_model
 from tests.converter_fixtures import SCRIPTS, bytes_under, command, input_for
 
@@ -202,10 +203,10 @@ def test_dynamic_late_asset_failure_keeps_retained_provenance(tmp_path, monkeypa
     monkeypatch.setattr(sys, "argv", ["quantize.py", "--input", str(source), "--output", str(target)])
     with monkeypatch.context() as patch:
 
-        def fail_assets(*_args):
+        def fail_assets(*_args, **_kwargs):
             raise ValueError("injected late asset failure")
 
-        patch.setattr(dynamic, "copy_tokenizer_assets", fail_assets)
+        patch.setattr(PreparedTokenizerAssets, "publish", fail_assets)
         with pytest.raises(ValueError, match="late asset failure"):
             dynamic.main()
     assert (target / "config.json").read_bytes() == previous

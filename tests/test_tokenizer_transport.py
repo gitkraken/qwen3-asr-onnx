@@ -59,7 +59,7 @@ def test_asset_publication_failure_restores_prior_tokenizer(tmp_path, monkeypatc
 
     def interrupt(src, dst):
         nonlocal failed
-        if not failed and Path(src).parent.name.startswith(".tokenizer-") and Path(dst) == target / failed_name:
+        if not failed and Path(src).name == failed_name and Path(dst) == target / failed_name:
             failed = True
             raise OSError("injected tokenizer publication failure")
         return replace(src, dst)

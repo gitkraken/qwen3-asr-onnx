@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from src.artifact_publication import ArtifactStaging, publish_artifacts
+from src.prompt import tokenizer_fingerprint as tokenizer_fingerprint
 
 
 def _json(value):
@@ -82,30 +83,6 @@ def recipe(kind, inputs, parameters, producer):
             )
         },
     }
-
-
-def tokenizer_fingerprint(tokenizer):
-    backend = getattr(tokenizer, "backend_tokenizer", None)
-    if backend is None:
-        raise ValueError("Calibration cache identity requires a serializable fast tokenizer backend")
-    value = {
-        "class": [type(tokenizer).__module__, type(tokenizer).__qualname__],
-        "backend": json.loads(backend.to_str()),
-        "template": tokenizer.get_chat_template(),
-        "special_tokens": tokenizer.special_tokens_map,
-        "settings": {
-            name: getattr(tokenizer, name, None)
-            for name in (
-                "padding_side",
-                "truncation_side",
-                "model_max_length",
-                "split_special_tokens",
-                "add_bos_token",
-                "add_eos_token",
-            )
-        },
-    }
-    return hashlib.sha256(_json(value).encode()).hexdigest()
 
 
 def cache_key(identity):

@@ -357,6 +357,8 @@ Each model directory is self-contained. For distribution, the int4 variant files
 
 Tokenizer artifacts use the canonical fast backend in `tokenizer.json`. Packaging and conversion reject metadata that overrides constructor file paths, selects another versioned backend, or enables alternate tokenizer construction. A version list that selects the canonical backend is allowed. Export can normalize ordinary split-vocabulary checkpoints and HuggingFace cache links; it rejects unsupported backend overrides and checks the original checkpoint's access paths before replacing or removing output assets.
 
+Tokenizer transport prepares an independent family before conversion starts. Families that depend on model configuration are serialized with their resolved class, backend, settings and templates, without replacing converter-owned model metadata. Any deferred regex correction is disabled after the source-selected backend is serialized, so another model config cannot change it later. Conflict checks use the actual prepared bytes, so retained graph storage is preserved and identical bytes can be reused.
+
 ## Architecture
 
 - **Encoder**: mel `[1, 128, T]` → windowed Conv2D (100-frame windows, 3x stride-2 convs producing 13 tokens per window) → windowed attention (104-token windows across transformer layers) → MLP projection → `[1, N, output_dim]` where `N = get_feat_extract_output_lengths(T)`. 0.6B: 18 layers, d=896, output_dim=1024. 1.7B: 24 layers, d=1024, output_dim=2048.
