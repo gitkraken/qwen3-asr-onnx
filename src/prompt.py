@@ -61,6 +61,11 @@ def build_prompt_ids(audio_token_count: int, tokenizer, language: str | None = N
         raise ValueError("context must be a string")
     if language is not None and (not isinstance(language, str) or not language.strip()):
         raise ValueError("language must be a nonempty string")
+    if language is not None:
+        from qwen_asr.inference.utils import normalize_language_name, validate_language
+
+        language = normalize_language_name(language)
+        validate_language(language)
     messages = [
         {"role": "system", "content": context},
         {"role": "user", "content": [{"type": "audio", "audio": ""}]},
