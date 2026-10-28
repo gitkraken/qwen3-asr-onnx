@@ -492,7 +492,7 @@ def test_unsafe_model_name_is_rejected_before_output(tmp_path, name):
 
 def test_failed_asset_publication_does_not_destroy_retained_quantization_provenance(tmp_path, monkeypatch):
     import quantize_nbits
-    from src.tokenizer_assets import copy_tokenizer_assets
+    from src.tokenizer_assets import PreparedTokenizerAssets
     from tests.tokenizer_fixtures import save_tokenizer_assets
 
     inputs, output = _split_output(tmp_path)
@@ -517,15 +517,15 @@ def test_failed_asset_publication_does_not_destroy_retained_quantization_provena
         ],
     )
 
-    def fail_after_ordinary_copies(*args):
+    def fail_after_ordinary_copies(*args, **kwargs):
         raise OSError("asset publication failed")
 
-    monkeypatch.setattr(quantize_nbits, "copy_tokenizer_assets", fail_after_ordinary_copies)
-    with pytest.raises(OSError, match="asset publication failed"):
-        quantize_nbits.main()
+    with monkeypatch.context() as publication:
+        publication.setattr(PreparedTokenizerAssets, "publish", fail_after_ordinary_copies)
+        with pytest.raises(OSError, match="asset publication failed"):
+            quantize_nbits.main()
     assert (output / "config.json").read_bytes() == prior
     assert (output / "decoder_init.int4.onnx").read_bytes() == graph
-    monkeypatch.setattr(quantize_nbits, "copy_tokenizer_assets", copy_tokenizer_assets)
     quantize_nbits.main()
     tags = json.loads((output / "config.json").read_text())["quantization"]
     assert tags["decoder_init"] == "int4_rtn_block32"

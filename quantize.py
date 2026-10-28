@@ -21,6 +21,7 @@ from pathlib import Path
 import onnx
 from onnxruntime.quantization import QuantType, quantize_dynamic
 
+from src.artifact_publication import ArtifactStaging, publish_artifacts
 from src.onnx_artifacts import (
     copy_artifact_entry,
     external_data_files,
@@ -187,34 +188,35 @@ def _run_conversion(args, tokenizer):
         # Output with suffix: encoder.int8.onnx, decoder_init.int8.onnx, etc.
         base = filename.removesuffix(".onnx")
         output_filename = f"{base}{suffix}.onnx"
-        output_path = os.path.join(args.output, output_filename)
         encoder_only_matmul = ["MatMul"] if filename == "encoder.onnx" else None
         # Only apply node exclusions to decoder files (encoder uses op_type filtering)
         file_exclude = exclude_nodes if filename != "encoder.onnx" else None
-        quantize_onnx_file(
-            input_path,
-            output_path,
-            op_types_to_quantize=encoder_only_matmul,
-            weight_type=weight_type,
-            nodes_to_exclude=file_exclude,
-        )
-
-    encoder_out = os.path.join(args.output, f"encoder{suffix}.onnx")
-    if f"encoder{suffix}.onnx" in generated_graphs and external_data_files(encoder_out):
-        print("  Embedding INT8 encoder weights into .onnx proto...")
-        enc = onnx.load(encoder_out, load_external_data=True)
-        onnx.save(enc, encoder_out)
-
-    # Inline quantized decoder_step weights into .onnx proto if under 2 GB.
-    step_out = os.path.join(args.output, f"decoder_step{suffix}.onnx")
-    step_data = external_data_files(step_out) if f"decoder_step{suffix}.onnx" in generated_graphs else set()
-    if step_data:
-        step_size = sum(path.stat().st_size for path in step_data)
-        if step_size < 1.8e9:  # safe margin under 2 GB protobuf limit
-            print("\nInlining INT8 decoder_step weights into .onnx proto...")
-            step_model = onnx.load(step_out, load_external_data=True)
-            onnx.save(step_model, step_out)
-            print(f"  {os.path.basename(step_out)}: {os.path.getsize(step_out) / 1e6:.1f} MB (self-contained)")
+        with ArtifactStaging(prefix=".quantize-", dir=args.output) as stage:
+            output_path = stage.path / output_filename
+            quantize_onnx_file(
+                input_path,
+                str(output_path),
+                op_types_to_quantize=encoder_only_matmul,
+                weight_type=weight_type,
+                nodes_to_exclude=file_exclude,
+            )
+            data = external_data_files(output_path)
+            if data and (
+                filename == "encoder.onnx"
+                or (filename == "decoder_step.onnx" and sum(path.stat().st_size for path in data) < 1.8e9)
+            ):
+                print(f"  Inlining {output_filename} weights into .onnx proto...")
+                model = onnx.load(output_path, load_external_data=True)
+                onnx.save(model, output_path)
+            data = external_data_files(output_path)
+            if data - {stage.path / f"{output_filename}.data"}:
+                raise ValueError(f"Unexpected quantizer output dependencies: {output_filename}")
+            onnx.checker.check_model(str(output_path))
+            publish_artifacts(
+                [(path, Path(args.output) / path.name) for path in sorted(data)]
+                + [(output_path, Path(args.output) / output_filename)]
+            )
+            stage.mark_complete()
 
     # Copy non-quantized files (skip if input == output)
     if os.path.realpath(args.input) != os.path.realpath(args.output):

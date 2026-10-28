@@ -235,9 +235,12 @@ def prepare_tokenizer_assets(source, target):
             # The serialized backend already contains the source-selected regex behavior.
             config["fix_mistral_regex"] = False
             config_path.write_text(json.dumps(config, indent=2) + "\n")
+            (prepared / "chat_template.json").write_text(
+                json.dumps({"chat_template": tokenizer.get_chat_template()}, indent=2) + "\n"
+            )
             if not _same_tokenizer(tokenizer, validate_tokenizer_assets(prepared)):
                 raise ValueError("Serialized tokenizer family changes tokenizer identity")
-            names = CANONICAL_TOKENIZER_FILES
+            names = CANONICAL_TOKENIZER_FILES | {"chat_template.json"}
         yield PreparedTokenizerAssets(source, target, prepared, names, reads)
         staging.mark_complete()
 

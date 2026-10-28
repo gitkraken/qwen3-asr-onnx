@@ -69,6 +69,40 @@ def test_export_removes_stale_processor_template_and_both_readers_agree(tmp_path
     ) == tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
 
 
+def test_normalized_family_preserves_official_processor_template(tmp_path):
+    from qwen_asr.core.transformers_backend.processing_qwen3_asr import Qwen3ASRProcessor
+
+    import export
+    from src.tokenizer_assets import copy_tokenizer_assets
+
+    source, target = tmp_path / "source", tmp_path / "target"
+    save_tokenizer_assets(source)
+    config_path = source / "tokenizer_config.json"
+    config = json.loads(config_path.read_text())
+    config.pop("tokenizer_class")
+    config["extra_special_tokens"] = {
+        "audio_token": "<|audio_pad|>",
+        "audio_bos_token": "<|audio_start|>",
+        "audio_eos_token": "<|audio_end|>",
+    }
+    config_path.write_text(json.dumps(config))
+    (source / "config.json").write_text(json.dumps({"model_type": "qwen2"}))
+    export.write_preprocessor_config(str(source))
+    processor = Qwen3ASRProcessor.from_pretrained(str(source), local_files_only=True)
+    messages = [{"role": "system", "content": ""}, {"role": "user", "content": [{"type": "audio", "audio": ""}]}]
+    expected = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    copy_tokenizer_assets(source, target)
+    export.write_preprocessor_config(str(target))
+    copied = Qwen3ASRProcessor.from_pretrained(str(target), local_files_only=True)
+    assert copied.apply_chat_template(messages, add_generation_prompt=True, tokenize=False) == expected
+    assert (
+        load_prompt_tokenizer(str(target), local_files_only=True).apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False
+        )
+        == expected
+    )
+
+
 @pytest.mark.parametrize("script", ["convert_fp16.py", "quantize_static.py", "quantize.py", "quantize_nbits.py"])
 def test_conflicting_reused_target_is_repaired_by_family_publication(tmp_path, script):
     from src.tokenizer_assets import validate_tokenizer_assets
