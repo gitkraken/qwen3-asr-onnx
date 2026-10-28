@@ -32,6 +32,58 @@ def validate_tokenizer_destination(root):
         raise ValueError(f"Unsupported tokenizer template directory: {directory}; use a clean output directory")
 
 
+def _validate_tokenizer_bindings(root, tokenizer=None):
+    from transformers import PreTrainedTokenizerFast
+    from transformers.models.auto.tokenization_auto import tokenizer_class_from_name
+    from transformers.tokenization_utils_base import get_fast_tokenizer_file
+
+    path = Path(root) / "tokenizer_config.json"
+    config = json.loads(path.read_text()) if path.is_file() else {}
+    if not isinstance(config, dict):
+        raise ValueError("Invalid tokenizer binding configuration")
+    tokenizer_class = type(tokenizer) if tokenizer is not None else None
+    if tokenizer_class is None and isinstance(config.get("tokenizer_class"), str):
+        tokenizer_class = tokenizer_class_from_name(config["tokenizer_class"])
+    file_slots = set(PreTrainedTokenizerFast.vocab_files_names)
+    if tokenizer_class is not None:
+        file_slots.update(tokenizer_class.vocab_files_names)
+    for slot in file_slots:
+        if slot in config:
+            raise ValueError(f"Unsupported tokenizer file binding: {slot}")
+    if config.get("from_slow") or any(
+        config.get(slot) is not None for slot in ("tokenizer_object", "__slow_tokenizer", "gguf_file")
+    ):
+        raise ValueError("Unsupported tokenizer construction binding")
+    if get_fast_tokenizer_file(config.get("fast_tokenizer_files", [])) != "tokenizer.json":
+        raise ValueError("Unsupported tokenizer backend binding; expected tokenizer.json")
+
+
+def _tokenizer_source_reads(root, tokenizer):
+    root = Path(root)
+    names = TOKENIZER_FILES | {"config.json"} | set(tokenizer.vocab_files_names.values())
+    reads = {root / name for name in names if (root / name).is_file()}
+    templates = root / "additional_chat_templates"
+    if templates.is_dir():
+        reads.update(path for path in templates.glob("*.jinja") if path.is_file())
+    return reads
+
+
+def tokenizer_checkpoint_reads(model_id, tokenizer):
+    from transformers.utils import cached_file
+
+    root = Path(model_id)
+    if not root.is_dir():
+        for name in ("tokenizer_config.json", "config.json", "tokenizer.json"):
+            resolved = cached_file(model_id, name, local_files_only=True, _raise_exceptions_for_missing_entries=False)
+            if resolved is not None:
+                root = Path(resolved).parent
+                break
+        else:
+            raise ValueError(f"Cannot establish tokenizer checkpoint source: {model_id}")
+    _validate_tokenizer_bindings(root, tokenizer)
+    return _tokenizer_source_reads(root, tokenizer)
+
+
 def validate_tokenizer_assets(root):
     root = Path(root)
     if not root.is_dir():
@@ -41,7 +93,11 @@ def validate_tokenizer_assets(root):
         if not (root / name).is_file():
             raise ValueError(f"Required tokenizer asset missing: {name}")
     try:
+        _validate_tokenizer_bindings(root)
         tokenizer = prompt.load_prompt_tokenizer(str(root), local_files_only=True)
+        _validate_tokenizer_bindings(root, tokenizer)
+        if not tokenizer.is_fast:
+            raise ValueError("Unsupported tokenizer binding; expected a fast tokenizer")
         validate_prompt_tokenizer(tokenizer)
         _validate_shipped_templates(root, tokenizer)
     except Exception as error:
@@ -91,18 +147,13 @@ def _validate_shipped_templates(root, tokenizer):
 
 def copy_tokenizer_assets(source, target) -> None:
     source, target = Path(source), Path(target)
-    validate_tokenizer_assets(source)
+    tokenizer = validate_tokenizer_assets(source)
     validate_tokenizer_destination(target)
     if source.resolve() == target.resolve():
         return
     names = tokenizer_asset_names(source)
-    source_reads = {source / name for name in names}
-    model_config = source / "config.json"
-    # The loader also reads model metadata for tokenizers with large vocabularies.
-    if model_config.is_file():
-        source_reads.add(model_config)
     validate_publication_sources(
-        source_reads,
+        _tokenizer_source_reads(source, tokenizer),
         files=(target / name for name in TOKENIZER_FILES),
     )
     target.mkdir(parents=True, exist_ok=True)

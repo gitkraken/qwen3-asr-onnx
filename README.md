@@ -355,6 +355,8 @@ output/
 
 Each model directory is self-contained. For distribution, the int4 variant files are: `encoder.int4.onnx` + `decoder_init.int4.onnx` + `decoder_step.int4.onnx` + `decoder_weights.int4.data` + `embed_tokens.bin` (FP16) + `config.json` + `tokenizer.json`. The FP32 files are optional extras for users who need maximum accuracy.
 
+Tokenizer artifacts use the canonical fast backend in `tokenizer.json`. Packaging and conversion reject metadata that overrides constructor file paths, selects another versioned backend, or enables alternate tokenizer construction. A version list that selects the canonical backend is allowed. Export can normalize ordinary split-vocabulary checkpoints and HuggingFace cache links; it rejects unsupported backend overrides and checks the original checkpoint's access paths before replacing or removing output assets.
+
 ## Architecture
 
 - **Encoder**: mel `[1, 128, T]` → windowed Conv2D (100-frame windows, 3x stride-2 convs producing 13 tokens per window) → windowed attention (104-token windows across transformer layers) → MLP projection → `[1, N, output_dim]` where `N = get_feat_extract_output_lengths(T)`. 0.6B: 18 layers, d=896, output_dim=1024. 1.7B: 24 layers, d=1024, output_dim=2048.

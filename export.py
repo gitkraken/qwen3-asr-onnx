@@ -18,12 +18,14 @@ Usage:
 import argparse
 import json
 import os
+from pathlib import Path
 
 import onnx
 import torch
 from transformers import AutoModel
 
 from src.artifact_publication import ArtifactStaging
+from src.artifact_sources import validate_publication_sources
 from src.decoder_wrapper import export_decoder_init, export_decoder_step
 from src.encoder_wrapper import export_encoder
 from src.onnx_artifacts import external_data_files, preflight_artifact_mutations
@@ -43,6 +45,7 @@ from src.tokenizer_assets import (
     TOKENIZER_FILES,
     copy_tokenizer_assets,
     tokenizer_asset_names,
+    tokenizer_checkpoint_reads,
     validate_tokenizer_assets,
     validate_tokenizer_destination,
 )
@@ -87,6 +90,10 @@ def load_model(model_id: str, device: str = "cpu", dtype=torch.float32):
 def copy_tokenizer(model_id: str, output_dir: str):
     validate_tokenizer_destination(output_dir)
     tokenizer = load_prompt_tokenizer(model_id)
+    validate_publication_sources(
+        tokenizer_checkpoint_reads(model_id, tokenizer),
+        files=(Path(output_dir) / name for name in TOKENIZER_FILES),
+    )
     tokenizer.chat_template = tokenizer.get_chat_template()
     with ArtifactStaging(prefix="qwen-tokenizer-export-", dir=None) as staging:
         tokenizer.save_pretrained(staging.path)

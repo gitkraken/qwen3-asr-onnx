@@ -1,5 +1,5 @@
 """
-quantize_nbits.py — Apply MatMulNBits (int4 or int8) block quantization to Qwen3-ASR decoder.
+quantize_nbits.py — Apply 4-bit MatMulNBits block quantization to Qwen3-ASR decoder.
 
 Uses ORT's MatMulNBitsQuantizer with RTN (default) or GPTQ algorithm.
 Produces a MatMulNBits ONNX graph — weights are stored as packed uint8 with per-group scales.
