@@ -1,3 +1,4 @@
+import builtins
 import json
 import os
 import subprocess
@@ -593,3 +594,109 @@ def test_conversion_to_package_transports_metadata(tmp_path, script):
     assert (output / "preprocessor_config.json").read_bytes() == before[Path("preprocessor_config.json")]
     assert pack.package(output, tmp_path / "release")
     assert {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()} == before
+
+
+@pytest.mark.parametrize("asset", ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja"])
+@pytest.mark.parametrize("chained", [False, True])
+def test_family_copy_preserves_source_access_through_stale_destination(tmp_path, asset, chained):
+    source, target = tmp_path / "source", tmp_path / "target"
+    save_tokenizer_assets(source)
+    target.mkdir()
+    source_asset = source / asset
+    retained = target / "vocab.json"
+    retained.write_bytes(source_asset.read_bytes())
+    source_asset.unlink()
+    if chained:
+        bridge = tmp_path / "bridge"
+        bridge.symlink_to(retained)
+        source_asset.symlink_to(bridge)
+    else:
+        source_asset.symlink_to(retained)
+    assert not (source / "vocab.json").exists()
+    validate_tokenizer_assets(source)
+    before_source = {path.name: path.read_bytes() for path in source.iterdir() if path.is_file()}
+    before_target = {path.name: path.read_bytes() for path in target.iterdir() if path.is_file()}
+    with pytest.raises(ValueError, match="source access path"):
+        copy_tokenizer_assets(source, target)
+    assert source_asset.is_symlink()
+    assert {path.name: path.read_bytes() for path in source.iterdir() if path.is_file()} == before_source
+    assert {path.name: path.read_bytes() for path in target.iterdir() if path.is_file()} == before_target
+    validate_tokenizer_assets(source)
+
+
+def test_family_copy_can_remove_distinct_hardlink_to_source(tmp_path):
+    source, target = tmp_path / "source", tmp_path / "target"
+    save_tokenizer_assets(source)
+    target.mkdir()
+    retained = target / "vocab.json"
+    os.link(source / "tokenizer.json", retained)
+    before = (source / "tokenizer.json").read_bytes()
+    copy_tokenizer_assets(source, target)
+    assert not retained.exists()
+    assert (source / "tokenizer.json").read_bytes() == before
+    validate_tokenizer_assets(source)
+    _assert_source_assets(source, target)
+
+
+@pytest.mark.parametrize("chained", [False, True])
+def test_family_copy_preserves_source_access_through_replaced_destination(tmp_path, chained):
+    source, target = tmp_path / "source", tmp_path / "target"
+    save_tokenizer_assets(source)
+    target.mkdir()
+    source_config = source / "tokenizer_config.json"
+    retained = target / "tokenizer.json"
+    retained.write_bytes(source_config.read_bytes())
+    source_config.unlink()
+    if chained:
+        bridge = tmp_path / "bridge"
+        bridge.symlink_to(retained)
+        source_config.symlink_to(bridge)
+    else:
+        source_config.symlink_to(retained)
+    validate_tokenizer_assets(source)
+    before_source = {path.name: path.read_bytes() for path in source.iterdir() if path.is_file()}
+    before_target = {path.name: path.read_bytes() for path in target.iterdir() if path.is_file()}
+    with pytest.raises(ValueError, match="source access path"):
+        copy_tokenizer_assets(source, target)
+    assert {path.name: path.read_bytes() for path in source.iterdir() if path.is_file()} == before_source
+    assert {path.name: path.read_bytes() for path in target.iterdir() if path.is_file()} == before_target
+    validate_tokenizer_assets(source)
+
+
+@pytest.mark.parametrize("chained", [False, True])
+def test_family_copy_preserves_model_config_read_by_large_tokenizer(tmp_path, monkeypatch, chained):
+    source, target = tmp_path / "source", tmp_path / "target"
+    save_tokenizer_assets(source)
+    tokenizer_path = source / "tokenizer.json"
+    document = json.loads(tokenizer_path.read_text())
+    document["model"]["vocab"].update({f"word_{index}": index + 200 for index in range(100001)})
+    tokenizer_path.write_text(json.dumps(document))
+    target.mkdir()
+    retained = target / "vocab.json"
+    retained.write_text(json.dumps({"model_type": "qwen3_asr", "retained_model_config": "original"}))
+    model_config = source / "config.json"
+    if chained:
+        bridge = tmp_path / "bridge"
+        bridge.symlink_to(retained)
+        model_config.symlink_to(bridge)
+    else:
+        model_config.symlink_to(retained)
+    opened = []
+    original_open = builtins.open
+
+    def observe_open(file, *args, **kwargs):
+        if isinstance(file, (str, os.PathLike)) and Path(file).absolute() == model_config.absolute():
+            opened.append(file)
+        return original_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", observe_open)
+    tokenizer = validate_tokenizer_assets(source)
+    assert tokenizer.vocab_size > 100000
+    assert opened
+    before_source = {path.name: path.read_bytes() for path in source.iterdir() if path.is_file()}
+    before_target = {path.name: path.read_bytes() for path in target.iterdir() if path.is_file()}
+    with pytest.raises(ValueError, match="source access path"):
+        copy_tokenizer_assets(source, target)
+    assert {path.name: path.read_bytes() for path in source.iterdir() if path.is_file()} == before_source
+    assert {path.name: path.read_bytes() for path in target.iterdir() if path.is_file()} == before_target
+    validate_tokenizer_assets(source)

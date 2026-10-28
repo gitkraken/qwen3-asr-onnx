@@ -542,3 +542,33 @@ def test_existing_shared_layout_is_preserved_on_share_and_package(tmp_path, layo
     assert pack.package(source, output)
     for name, values in expected.items():
         np.testing.assert_array_equal(_ort_result(output / name), values)
+
+
+@pytest.mark.parametrize("entrypoint", ["helper", "cli"])
+def test_package_preserves_existing_regular_file_output(tmp_path, entrypoint):
+    source = _release_input(tmp_path / "source")
+    output = tmp_path / "release"
+    output.write_bytes(b"independent retained user file")
+    before = {path.relative_to(source): path.read_bytes() for path in source.rglob("*") if path.is_file()}
+    if entrypoint == "helper":
+        assert not pack.package(source, output)
+    else:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve().parents[1] / "package.py"),
+                "--input",
+                str(source),
+                "--output",
+                str(output),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode != 0, result.stdout + result.stderr
+    assert output.is_file()
+    assert output.read_bytes() == b"independent retained user file"
+    assert {path.relative_to(source): path.read_bytes() for path in source.rglob("*") if path.is_file()} == before
+    assert not (tmp_path / "release.tar.gz").exists()
+    assert not (tmp_path / "release-int4.tar.gz").exists()

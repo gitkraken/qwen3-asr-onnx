@@ -4,6 +4,7 @@ from pathlib import Path
 
 from src import prompt
 from src.artifact_publication import ArtifactStaging, publish_artifacts
+from src.artifact_sources import validate_publication_sources
 from src.prompt import validate_prompt_tokenizer
 
 TOKENIZER_FILES = frozenset(
@@ -95,6 +96,15 @@ def copy_tokenizer_assets(source, target) -> None:
     if source.resolve() == target.resolve():
         return
     names = tokenizer_asset_names(source)
+    source_reads = {source / name for name in names}
+    model_config = source / "config.json"
+    # The loader also reads model metadata for tokenizers with large vocabularies.
+    if model_config.is_file():
+        source_reads.add(model_config)
+    validate_publication_sources(
+        source_reads,
+        files=(target / name for name in TOKENIZER_FILES),
+    )
     target.mkdir(parents=True, exist_ok=True)
     for name in TOKENIZER_FILES:
         if (target / name).is_dir():

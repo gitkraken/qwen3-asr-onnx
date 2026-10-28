@@ -85,6 +85,8 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
             raise ValueError(f"Input directory overlaps publication destination: {target}")
     if output.is_symlink():
         raise ValueError("Output cannot be a symlink")
+    if output.exists() and not output.is_dir():
+        raise ValueError(f"Output must be a directory: {output}")
     validate_release_metadata(source)
     variants = [variant for variant in ("", "int4") if any((source / name).exists() for name in _graph_names(variant))]
     if not variants:
