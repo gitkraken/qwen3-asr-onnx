@@ -10,10 +10,11 @@ jobs:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v6
         with:
-          python-version: "3.12.13"
-      - run: python -m unittest tests.test_source_access -v
+          version: "0.11.20"
+          enable-cache: false
+      - run: uv run --no-project --python 3.12.13 python -m unittest tests.test_source_access -v
 
   regression:
     runs-on: macos-15
