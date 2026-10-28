@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 from share_weights import share_external_models
 from src.artifact_metadata import MODEL_METADATA_FILES
 from src.artifact_publication import ArtifactStaging, publish_artifacts
+from src.artifact_sources import paths_overlap, validate_publication_sources
 from src.embeddings import load_embed_tokens
 from src.onnx_artifacts import graph_file_closure, transport_graph_files
 from src.release_validation import REQUIRED_METADATA, validate_release, validate_release_metadata
@@ -80,8 +81,7 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
         variant: output.parent / f"{output.name}{'-int4' if variant else ''}.tar.gz" for variant in ("", "int4")
     }
     for target in [output, *archives.values()]:
-        resolved_target = target.resolve()
-        if source.is_relative_to(resolved_target) or resolved_target.is_relative_to(source):
+        if paths_overlap(source, target):
             raise ValueError(f"Input directory overlaps publication destination: {target}")
     if output.is_symlink():
         raise ValueError("Output cannot be a symlink")
@@ -125,12 +125,20 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
         unaffected_graphs.extend(name for other in variants if other != variant for name in _graph_names(other))
         if canonical in graph_file_closure(source, unaffected_graphs):
             raise ValueError(f"ONNX transport destination conflict: {canonical}")
+    metadata = set(MODEL_METADATA_FILES) | tokenizer_asset_names(source)
+    read_names = metadata | graph_files | {"embed_tokens.bin"}
+    if sidecar.exists():
+        read_names.add(sidecar.name)
+    read_roots = {Path(input_dir).absolute(), source}
+    source_reads = {root / name for root in read_roots for name in read_names} | read_roots
+    if test_wavs_src is not None:
+        source_reads.add(Path(test_wavs_src))
+    validate_publication_sources(source_reads, files=archives.values(), directories=[output])
     output.parent.mkdir(parents=True, exist_ok=True)
     with ArtifactStaging(prefix=".package-", dir=output.parent) as staging:
         stage = staging.path
         release = stage / output.name
         release.mkdir()
-        metadata = set(MODEL_METADATA_FILES) | tokenizer_asset_names(source)
         names = set(metadata)
         names.update(graph_files)
         for name in sorted(names):

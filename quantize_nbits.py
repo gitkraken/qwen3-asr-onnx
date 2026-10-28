@@ -296,6 +296,7 @@ def main():
         files,
         generated=generated,
         rewritten={"config.json"},
+        read_files={"config.json"},
         copied_assets=tokenizer_files,
         removed=TOKENIZER_FILES - tokenizer_files if tokenizer_files else (),
         reads=[f"{name}.onnx" for name in args.decoders],

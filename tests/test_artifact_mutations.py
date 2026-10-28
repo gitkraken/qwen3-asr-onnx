@@ -45,6 +45,71 @@ def bytes_under(root):
     return {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
 
 
+def test_package_preserves_source_metadata_referencing_output(tmp_path):
+    from src.embeddings import load_embed_tokens
+
+    source = _release_input(tmp_path / "source")
+    target = tmp_path / "target"
+    target.mkdir()
+    config = source / "config.json"
+    (target / config.name).write_bytes(config.read_bytes())
+    config.unlink()
+    config.symlink_to(target / config.name)
+    before = bytes_under(source)
+    expected = load_embed_tokens(source)
+    assert not package.package(source, target)
+    assert bytes_under(source) == before
+    np.testing.assert_array_equal(load_embed_tokens(source), expected)
+
+
+def test_package_preserves_intermediate_source_directory_link(tmp_path):
+    source = _release_input(tmp_path / "safe")
+    target = tmp_path / "target"
+    target.mkdir()
+    bridge = target / "bridge"
+    bridge.symlink_to(source, target_is_directory=True)
+    original = tmp_path / "source"
+    original.symlink_to(bridge, target_is_directory=True)
+    before = bytes_under(source)
+    assert not package.package(original, target)
+    assert original.is_dir()
+    assert bytes_under(original) == before
+
+
+@pytest.mark.parametrize("script", SCRIPTS)
+def test_converter_preserves_source_config_referencing_output(tmp_path, script):
+    source = input_for(tmp_path, script)
+    target = tmp_path / "target"
+    target.mkdir()
+    config = source / "config.json"
+    (target / config.name).write_bytes(config.read_bytes())
+    config.unlink()
+    config.symlink_to(target / config.name)
+    before_source, before_target = bytes_under(source), bytes_under(target)
+    result = subprocess.run(command(tmp_path, script, source, target), capture_output=True, text=True, timeout=90)
+    assert result.returncode != 0
+    assert "source" in (result.stdout + result.stderr).lower()
+    assert bytes_under(source) == before_source
+    assert bytes_under(target) == before_target
+
+
+def test_embedding_sidecar_preserves_canonical_source_alias(tmp_path):
+    from convert_embed_fp16 import convert_embed_fp16
+    from src.embeddings import load_embed_tokens
+
+    source = _release_input(tmp_path / "source")
+    canonical = source / "embed_tokens.bin"
+    sidecar = source / "embed_tokens.fp16.bin"
+    canonical.rename(sidecar)
+    canonical.symlink_to(sidecar.name)
+    expected = load_embed_tokens(source)
+    before = bytes_under(source)
+    with pytest.raises(ValueError, match="source"):
+        convert_embed_fp16(source)
+    assert bytes_under(source) == before
+    np.testing.assert_array_equal(load_embed_tokens(source), expected)
+
+
 @pytest.mark.parametrize("script", SCRIPTS)
 def test_all_producers_preserve_other_precision_storage_before_tokenizer_removal(tmp_path, script):
     source = input_for(tmp_path, script)

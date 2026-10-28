@@ -5,6 +5,7 @@ import os
 import tempfile
 from pathlib import Path
 
+from src.artifact_sources import validate_publication_sources
 from src.embeddings import load_embed_tokens
 
 
@@ -12,6 +13,7 @@ def convert_embed_fp16(model_dir):
     root = Path(model_dir)
     embed = load_embed_tokens(root, output_dtype="float16")
     destination = root / "embed_tokens.fp16.bin"
+    validate_publication_sources([root / "embed_tokens.bin", root / "config.json"], files=[destination])
     descriptor, tmp = tempfile.mkstemp(prefix=".embed-fp16-", dir=root)
     try:
         with os.fdopen(descriptor, "wb") as stream:

@@ -12,6 +12,7 @@ from google.protobuf.descriptor import FieldDescriptor
 from google.protobuf.message import DecodeError
 
 from src.artifact_publication import ArtifactStaging
+from src.artifact_sources import validate_publication_sources
 
 
 def storage_tensors(message, initializer=False):
@@ -129,8 +130,19 @@ def retained_quantization(output, suffix, generated, *, existing=None):
 
 
 def preflight_artifact_mutations(
-    source, output, copies, *, generated=(), rewritten=(), removed=(), reads=(), existing=None, copied_assets=()
+    source,
+    output,
+    copies,
+    *,
+    generated=(),
+    rewritten=(),
+    removed=(),
+    reads=(),
+    read_files=(),
+    existing=None,
+    copied_assets=(),
 ):
+    source_root = Path(source).absolute()
     destination_root = Path(output).absolute()
     source, output = Path(source).resolve(), destination_root.resolve()
     generated, rewritten, removed = set(generated), set(rewritten), set(removed)
@@ -149,12 +161,20 @@ def preflight_artifact_mutations(
         protected_source = source_dependencies
         source_mutations = generated | rewritten | removed
     else:
-        source_entries = source_graphs | {source / name for name in files}
+        source_entries = source_graphs | {
+            source / name for name in files | set(read_files) if (source / name).is_file()
+        }
         protected_source = source_dependencies | source_entries | {path.resolve() for path in source_entries}
         source_mutations = files | generated | rewritten | removed | assets
     source_conflicts = {name for name in source_mutations if output / name in protected_source}
     if source_conflicts:
         raise ValueError(f"ONNX source graph destination conflict: {', '.join(sorted(source_conflicts))}")
+    if source != output:
+        source_reads = source_entries | source_dependencies
+        validate_publication_sources(
+            [*source_reads, *(source_root / path.relative_to(source) for path in source_reads)],
+            files=(destination_root / name for name in source_mutations),
+        )
     conflicts = (files & generated) | (dependencies & (rewritten | removed))
     if source == output:
         read_dependencies = set().union(*(incoming[name] for name in reads if name in incoming))
