@@ -1,5 +1,14 @@
 # Qwen3-ASR ONNX Export Tool
 
+This is GitKraken's Apache-2.0 fork of
+[andrewleech/qwen3-asr-onnx](https://github.com/andrewleech/qwen3-asr-onnx),
+starting from `4aee2ae0c355c7bc33bd5c09befec9e9eabd4b50`.
+It maintains native Qwen parity, artifact validation and recoverable export tools.
+See [MAINTAINING.md](MAINTAINING.md) for the supported environment, regression
+checks, checkpoint validation and upstream contribution boundaries.
+The benchmarks and pre-exported model links below describe upstream's historical
+releases; they are not measurements of this fork or Kepler's rebuilt revisions.
+
 Export [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) and [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) to ONNX format for use with ONNX Runtime.
 
 Pre-exported models on HuggingFace:
@@ -104,9 +113,10 @@ RTF measured on Ryzen AI 7 PRO 350 (native Windows, ORT 2.0 rc12). WER from 200-
 ## Setup
 
 ```bash
+uv sync --locked --python 3.12.13
+uv run pytest -q
+# pip alternative (runtime dependencies; use Python 3.12):
 pip install -r requirements.txt
-# or with uv:
-uv sync
 ```
 
 ## Pipeline
@@ -140,14 +150,17 @@ python optimize_graphs.py --input output/qwen3-asr-1.7b
 ```
 
 Applies ORT transformer optimizer fusions that the runtime optimizer does not perform:
-- **Decoders:** Fuses decomposed RMSNorm into `SimplifiedLayerNormalization` — 7% speedup on FP32, 4% on int4 ([111], [113])
+- **Decoders:** Retains supported skip-RMS fusions. Standalone RMSNorm uses a model-local ONNX function with FP32 normalization followed by scale/output-dtype scaling. This avoids serializing ORT's unregistered default-domain `SimplifiedLayerNormalization` and preserves the graph's existing opset.
 - **Encoder:** Fuses `SkipLayerNormalization` (skip-connection + LayerNorm) and `BiasGelu` — ~4% speedup when int4 decoders make the encoder the bottleneck ([112])
 
-Must be applied to FP32 graphs before quantization so that int4 weights are calibrated against the fused kernels ([113]).
+Apply optimization to FP32 graphs before quantization. The saved graphs must pass the ONNX checker. Historical decoder fusion speedups do not establish the performance of the portable function; measure the resulting exports.
 
 ### 4. int4 MatMulNBits Quantization (recommended for both 0.6B and 1.7B)
 
-`quantize_nbits.py` applies ORT's `MatMulNBitsQuantizer` to the decoder files. The encoder uses a native FP16 export (half the size of FP32, zero WER impact).
+`quantize_nbits.py` applies ORT's `MatMulNBitsQuantizer` to the decoder files.
+The supported ORT 1.31.0 RTN/GPTQ paths emit 4-bit weights. Both reject `--bits 8`
+before creating outputs. Node exclusions are supported by RTN; GPTQ rejects
+exclusions explicitly. Every emitted quantized operator is checked before saving. The encoder uses a native FP16 export (half the size of FP32, zero WER impact).
 
 ```bash
 # RTN (no calibration data, fast — adds .int4 files alongside FP32):
@@ -178,7 +191,7 @@ INT8 AWQ is not published to HuggingFace but can be built locally for a smaller-
 # Collect calibration activations, smooth weights, re-export FP32 ONNX
 python awq_smooth.py --model Qwen/Qwen3-ASR-0.6B \
     --output output/qwen3-asr-0.6b-smooth \
-    --alpha 0.2 --n-samples 128 --verify
+    --alpha 0.2 --n-samples 128 --device cpu --verify
 
 # Quantize the smoothed model to INT8 (adds .int8 files alongside FP32)
 python quantize.py \
@@ -186,13 +199,12 @@ python quantize.py \
     --output output/qwen3-asr-0.6b
 ```
 
-α=0.2 is the optimal smoothing strength for 0.6B INT8. Calibration activations are cached in the smooth output directory (`calibration_activations.npz`). To sweep alpha values without re-collecting:
+α=0.2 is the optimal smoothing strength for 0.6B INT8. Calibration activations are cached in the smooth output directory as `calibration_activations_<identity>.npz`. To sweep alpha values without re-collecting, keep the same model, output directory, sample count and device; only change alpha. The default cache key excludes alpha and verifies the checkpoint, tokenizer and collection recipe:
 
 ```bash
 python awq_smooth.py --model Qwen/Qwen3-ASR-0.6B \
     --output output/qwen3-asr-0.6b-smooth \
-    --alpha 0.2 \
-    --activations-cache output/qwen3-asr-0.6b-smooth/calibration_activations.npz
+    --n-samples 128 --device cpu --alpha 0.4
 ```
 
 ### Evaluate WER
@@ -231,7 +243,7 @@ uv run python validate.py \
     --onnx-dir output/qwen3-asr-0.6b \
     --audio tests/fixtures/test_audio.wav
 
-# Optimize encoder + decoders (fuses RMSNorm, SkipLayerNorm, BiasGelu — 4-7% speedup)
+# Optimize and validate encoder and decoder graphs
 uv run python optimize_graphs.py --input output/qwen3-asr-0.6b
 
 # int4 RTN al4 decoders (recommended)
@@ -258,7 +270,7 @@ uv run python validate.py \
     --onnx-dir output/qwen3-asr-1.7b \
     --audio tests/fixtures/test_audio.wav
 
-# Optimize encoder + decoders (fuses RMSNorm, SkipLayerNorm, BiasGelu — 4-7% speedup)
+# Optimize and validate encoder and decoder graphs
 uv run python optimize_graphs.py --input output/qwen3-asr-1.7b
 
 # int4 RTN al4 decoders (same as 0.6B — GPTQ provides no WER benefit, see experiment [109])
@@ -390,7 +402,9 @@ Note: DirectML produces incorrect output on AMD Radeon iGPUs (tested on 860M). N
 ## Tests
 
 ```bash
-python -m pytest tests/
+uv run --locked pytest -q
+# Full original-checkpoint encoder validation:
+uv run --locked pytest -m integration tests/full/test_checkpoint_encoder.py -s
 ```
 
 Audio fixtures in `tests/fixtures/` are tracked with Git LFS. Run `git lfs pull` after cloning to fetch them. See `tests/fixtures/README.md` for provenance.

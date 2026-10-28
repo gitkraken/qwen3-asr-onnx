@@ -12,12 +12,14 @@ Usage:
 
 import argparse
 import os
-import subprocess
+import tarfile
+from pathlib import Path
 
 from huggingface_hub import HfApi
 
-# Shared metadata files included in every archive
-METADATA = ["embed_tokens.bin", "config.json", "tokenizer.json"]
+from src.artifact_publication import ArtifactStaging
+from src.onnx_artifacts import inventory_graphs, validate_generated_destinations
+from src.release_validation import validate_release
 
 # Archives are built from release/ dirs (produced by package.py), which contain
 # the correct FP16 embed_tokens.bin and patched config.json.
@@ -30,7 +32,6 @@ ARCHIVES = [
             "encoder.onnx",
             "decoder_init.onnx",
             "decoder_step.onnx",
-            "decoder_weights.data",
         ],
     },
     {
@@ -41,11 +42,8 @@ ARCHIVES = [
             "encoder.int4.onnx",
             "decoder_init.int4.onnx",
             "decoder_step.int4.onnx",
-            "decoder_weights.int4.data",
         ],
     },
-    # NOTE: decoder_weights.int4.data is the shared external data file
-    # produced by share_weights.py — replaces per-file .onnx.data files
     {
         "name": "qwen3-asr-1.7b",
         "source_dir": "release/qwen3-asr-1.7b",
@@ -54,7 +52,6 @@ ARCHIVES = [
             "encoder.onnx",
             "decoder_init.onnx",
             "decoder_step.onnx",
-            "decoder_weights.data",
         ],
     },
     {
@@ -65,55 +62,54 @@ ARCHIVES = [
             "encoder.int4.onnx",
             "decoder_init.int4.onnx",
             "decoder_step.int4.onnx",
-            "decoder_weights.int4.data",
         ],
     },
 ]
 
 
+def _archive_destination(source, output, name, members):
+    if not isinstance(name, str) or not name or name in {".", ".."} or Path(name).name != name or "\\" in name:
+        raise ValueError("Archive name must be a single safe path component")
+    source, output = Path(source).resolve(), Path(output).resolve()
+    filename = f"{name}.tar.gz"
+    validate_generated_destinations(output, [filename])
+    target = output / filename
+    graphs = inventory_graphs(source)
+    protected_names = set(members) | graphs.keys() | {name for names in graphs.values() for name in names}
+    protected = {source / name for name in protected_names}
+    if target in protected | {path.resolve() for path in protected} or (
+        target.exists() and any(target.samefile(path) for path in protected)
+    ):
+        raise ValueError(f"Archive destination would replace a source artifact: {target}")
+    return target
+
+
 def create_tar(archive, output_dir):
-    """Create a tar.gz archive with the correct directory structure."""
     name = archive["name"]
-    source_dir = archive["source_dir"]
-    all_files = archive["files"] + METADATA
-    tar_path = os.path.join(output_dir, f"{name}.tar.gz")
-
-    # Verify all source files exist
-    for f in all_files:
-        src = os.path.join(source_dir, f)
-        if not os.path.exists(src):
-            print(f"  ERROR: {src} not found")
-            return None
-
-    # Get source directory basename for --transform
-    source_basename = os.path.basename(source_dir.rstrip("/"))
-
-    # Build tar file list (relative to parent of source_dir)
-    parent_dir = os.path.dirname(os.path.abspath(source_dir))
-    tar_members = [f"{source_basename}/{f}" for f in all_files]
-
-    # Use --transform to rename the top-level directory if needed
-    cmd = ["tar", "cf", "-", "-C", parent_dir]
-    if source_basename != name:
-        cmd += [f"--transform=s,^{source_basename},{name},"]
-    cmd += tar_members
-
-    # Pipe through gzip -1 (fast, weights are incompressible)
+    source_dir = Path(archive["source_dir"]).resolve()
+    graphs = {filename for filename in archive["files"] if filename.endswith(".onnx")}
+    try:
+        all_files = validate_release(source_dir, graphs)
+        tar_path = _archive_destination(source_dir, output_dir, name, all_files)
+    except Exception as error:
+        print(f"  ERROR: Invalid release: {error}")
+        return None
     print(f"  Creating {tar_path}...")
-    with open(tar_path, "wb") as f:
-        tar_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
-        gz_proc = subprocess.Popen(["gzip", "-1"], stdin=tar_proc.stdout, stdout=f)
-        tar_proc.stdout.close()
-        gz_proc.wait()
-        tar_proc.wait()
-
-    if tar_proc.returncode != 0 or gz_proc.returncode != 0:
-        print("  ERROR: tar/gzip failed")
+    try:
+        with ArtifactStaging(prefix=".archive-", dir=tar_path.parent) as staging:
+            staged_tar = staging.path / tar_path.name
+            with tarfile.open(staged_tar, "w:gz", compresslevel=1, dereference=True) as target:
+                for filename in sorted(all_files):
+                    target.add(source_dir / filename, arcname=f"{name}/{filename}", recursive=False)
+            os.replace(staged_tar, tar_path)
+            staging.mark_complete()
+    except (OSError, tarfile.TarError) as error:
+        print(f"  ERROR: Archive creation failed: {error}")
         return None
 
     size = os.path.getsize(tar_path)
     print(f"  Size: {size / 1e6:.1f} MB ({size / 1e9:.2f} GB)")
-    return tar_path
+    return str(tar_path)
 
 
 def upload_tar(tar_path, repo, filename):
@@ -137,6 +133,7 @@ def main():
     args = parser.parse_args()
 
     results = []
+    failed = False
 
     for archive in ARCHIVES:
         name = archive["name"]
@@ -149,6 +146,7 @@ def main():
 
         tar_path = create_tar(archive, args.output_dir)
         if tar_path is None:
+            failed = True
             print("  FAILED")
             continue
 
@@ -166,6 +164,8 @@ def main():
     print("Summary:")
     for filename, size_mb, repo in results:
         print(f"  {filename}: {size_mb:.1f} MB → {repo}")
+
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
