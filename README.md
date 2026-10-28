@@ -150,7 +150,7 @@ python optimize_graphs.py --input output/qwen3-asr-1.7b
 ```
 
 Applies ORT transformer optimizer fusions that the runtime optimizer does not perform:
-- **Decoders:** Retains supported skip-RMS fusions. Standalone RMSNorm uses a model-local ONNX function with FP32 normalization followed by activation-dtype scaling. This avoids serializing ORT's unregistered default-domain `SimplifiedLayerNormalization` and preserves the graph's existing opset.
+- **Decoders:** Retains supported skip-RMS fusions. Standalone RMSNorm uses a model-local ONNX function with FP32 normalization followed by scale/output-dtype scaling. This avoids serializing ORT's unregistered default-domain `SimplifiedLayerNormalization` and preserves the graph's existing opset.
 - **Encoder:** Fuses `SkipLayerNormalization` (skip-connection + LayerNorm) and `BiasGelu` — ~4% speedup when int4 decoders make the encoder the bottleneck ([112])
 
 Apply optimization to FP32 graphs before quantization. The saved graphs must pass the ONNX checker. Historical decoder fusion speedups do not establish the performance of the portable function; measure the resulting exports.

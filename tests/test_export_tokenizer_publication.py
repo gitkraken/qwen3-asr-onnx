@@ -6,7 +6,7 @@ import pytest
 import export
 from src import artifact_publication
 from src.tokenizer_assets import validate_tokenizer_assets
-from tests.test_artifact_contract import _ort_result, _write_external_identity, _write_model
+from tests.artifact_fixtures import _ort_result, _write_external_identity, _write_model
 from tests.tokenizer_fixtures import OFFICIAL_CHAT_TEMPLATE, save_tokenizer_assets
 
 

@@ -10,7 +10,7 @@ from onnx import helper, numpy_helper
 import awq_smooth
 import collect_gptq_calib
 from src import prompt
-from tests.test_artifact_contract import _release_input
+from tests.artifact_fixtures import _release_input
 from tests.tokenizer_fixtures import OFFICIAL_CHAT_TEMPLATE, save_tokenizer_assets
 
 

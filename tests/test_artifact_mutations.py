@@ -10,39 +10,8 @@ from google.protobuf.message import DecodeError
 
 import package
 import share_weights
-from tests.test_artifact_contract import _ort_result, _release_input, _write_external_identity, _write_model
-from tests.test_tokenizer_transport import ROOT, _converter_command, _source
-
-SCRIPTS = ["convert_fp16.py", "quantize_static.py", "quantize.py", "quantize_nbits.py"]
-
-
-def command(root, script, source, target):
-    if script == "quantize_nbits.py":
-        return [
-            sys.executable,
-            str(ROOT / script),
-            "--input",
-            str(source),
-            "--output",
-            str(target),
-            "--bits",
-            "4",
-            "--block-size",
-            "32",
-        ]
-    return _converter_command(root, script, source, target)
-
-
-def input_for(root, script):
-    source = _source(root / "source", "embedded")
-    if script == "quantize_nbits.py":
-        for name in ("decoder_init.onnx", "decoder_step.onnx"):
-            _write_model(source, name, weight=np.ones((64, 64), dtype=np.float32))
-    return source
-
-
-def bytes_under(root):
-    return {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+from tests.artifact_fixtures import _ort_result, _release_input, _write_external_identity, _write_model
+from tests.converter_fixtures import ROOT, SCRIPTS, _converter_command, bytes_under, command, input_for
 
 
 def test_package_preserves_source_metadata_referencing_output(tmp_path):

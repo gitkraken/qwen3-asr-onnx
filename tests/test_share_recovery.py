@@ -13,7 +13,7 @@ import torch
 from onnx import TensorProto, helper, numpy_helper
 
 import share_weights as share
-from tests.test_artifact_contract import _ort_result, _write_external_identity, _write_model
+from tests.artifact_fixtures import _ort_result, _write_external_identity, _write_model
 from tests.test_native_decoder import (
     assert_decoder_matches,
     prefill_inputs,

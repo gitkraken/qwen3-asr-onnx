@@ -24,7 +24,7 @@ ORT's default-domain `SimplifiedLayerNormalization` has no ONNX schema in the
 supported environment. The optimizer replaces standalone instances with a local
 `qwen3_asr::RMSNormalization` function using standard ONNX operations at the
 graph's existing opset. It computes normalization in FP32, casts the normalized
-result to the activation dtype, then scales it. The function body preserves that
+result to the scale/output dtype, then scales it. The function body preserves that
 boundary through both supported FP16 converters. Opsets 17 and 18 are tested.
 Unsupported normalization attributes, axes, outputs or conflicting function
 definitions fail instead of silently changing the operation. Existing supported

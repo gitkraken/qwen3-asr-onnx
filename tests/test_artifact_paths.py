@@ -9,8 +9,8 @@ import pytest
 import quantize as dynamic
 import quantize_static as static
 from src import onnx_artifacts
-from tests.test_artifact_contract import _ort_result, _write_external_identity, _write_model
-from tests.test_artifact_mutations import SCRIPTS, bytes_under, command, input_for
+from tests.artifact_fixtures import _ort_result, _write_external_identity, _write_model
+from tests.converter_fixtures import SCRIPTS, bytes_under, command, input_for
 
 
 @pytest.mark.parametrize("script", SCRIPTS)

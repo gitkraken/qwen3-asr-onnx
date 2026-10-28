@@ -11,7 +11,7 @@ import pytest
 
 import create_tar
 from src.release_validation import graph_names, validate_release
-from tests.test_artifact_contract import _ort_result, _release_input, _write_external_identity, _write_model
+from tests.artifact_fixtures import _ort_result, _release_input, _write_external_identity, _write_model
 
 
 def _archive(source):

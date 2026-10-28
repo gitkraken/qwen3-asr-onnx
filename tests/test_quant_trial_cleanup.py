@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from tests.test_artifact_contract import _ort_result, _release_input, _write_model
+from tests.artifact_fixtures import _ort_result, _release_input, _write_model
 
 ROOT = Path(__file__).resolve().parents[1]
 

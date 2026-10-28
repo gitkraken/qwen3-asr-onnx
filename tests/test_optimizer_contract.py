@@ -314,3 +314,40 @@ def test_standard_layer_norm_can_still_fuse_with_its_residual(tmp_path):
     onnx.checker.check_model(str(path))
     assert any(node.op_type == "SkipLayerNormalization" for node in onnx.load(path).graph.node)
     np.testing.assert_allclose(_run(path, values, residual), expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("opset", [17, 18])
+@pytest.mark.parametrize("input_dtype,scale_dtype", [(np.float32, np.float16), (np.float16, np.float32)])
+def test_portable_rms_preserves_independent_scale_output_dtype(tmp_path, opset, input_dtype, scale_dtype):
+    scale = np.linspace(0.5, 1.5, 8, dtype=scale_dtype)
+    model = _model(
+        [
+            helper.make_node(
+                "SimplifiedLayerNormalization",
+                ["x", "scale"],
+                ["y"],
+                axis=-1,
+                epsilon=1e-7,
+                stash_type=TensorProto.FLOAT,
+            )
+        ],
+        {"scale": scale},
+        opset=opset,
+    )
+    model.graph.input[0].type.tensor_type.elem_type = helper.np_dtype_to_tensor_dtype(np.dtype(input_dtype))
+    model.graph.output[0].type.tensor_type.elem_type = helper.np_dtype_to_tensor_dtype(np.dtype(scale_dtype))
+    path = tmp_path / "mixed-rms.onnx"
+    onnx.save(model, path)
+    values = np.array(
+        [[[1000, -1000, 700, -700, 500, -500, 900, -900], [0, 1e-5, -1e-5, 3e-5, -3e-5, 1e-4, -1e-4, 2e-4]]],
+        dtype=input_dtype,
+    )
+    expected = _run(path, values)
+    assert expected.dtype == scale_dtype
+    assert _portable_rms_norms(OnnxModel(model)) == 1
+    onnx.checker.check_model(model, full_check=True)
+    onnx.save(model, path)
+    actual = _run(path, values)
+    assert actual.dtype == scale_dtype
+    assert np.isfinite(actual).all()
+    np.testing.assert_allclose(actual, expected, atol=np.finfo(scale_dtype).eps, rtol=np.finfo(scale_dtype).eps)

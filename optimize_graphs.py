@@ -57,7 +57,7 @@ def _rms_function(opset):
         onnx.helper.make_node("Add", ["mean", "epsilon"], ["variance"]),
         onnx.helper.make_node("Sqrt", ["variance"], ["rms"]),
         onnx.helper.make_node("Div", ["stats", "rms"], ["normalized_stats"]),
-        onnx.helper.make_node("CastLike", ["normalized_stats", "X"], ["normalized"]),
+        onnx.helper.make_node("CastLike", ["normalized_stats", "scale"], ["normalized"]),
         onnx.helper.make_node("Mul", ["normalized", "scale"], ["Y"]),
     ]
     return onnx.helper.make_function(

@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from src.onnx_artifacts import retained_quantization
-from tests.test_artifact_contract import _write_model
+from tests.artifact_fixtures import _write_model
 
 
 def test_retained_tags_come_from_decoded_graph_roles(tmp_path):

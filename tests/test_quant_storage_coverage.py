@@ -5,8 +5,8 @@ from onnx import helper, numpy_helper
 
 from quantize_nbits import _quantization_input, quantize_decoder
 from src.onnx_artifacts import external_data_files, isolated_onnx_input, validate_quantization_storage
-from tests.test_artifact_contract import _write_model
-from tests.test_quant_precision import source
+from tests.artifact_fixtures import _write_model
+from tests.quantization_fixtures import source
 
 
 def _input_with_external_metadata(tmp_path, placement, duplicate=False):

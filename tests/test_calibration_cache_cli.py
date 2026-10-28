@@ -11,8 +11,8 @@ import awq_smooth
 import quantize_static
 from src.calibration_cache import model_fingerprint, recipe, save_cache, tokenizer_fingerprint
 from src.onnx_export import export_onnx
-from tests.test_artifact_contract import _ort_result, _write_external_identity
-from tests.test_tokenizer_transport import _source
+from tests.artifact_fixtures import _ort_result, _write_external_identity
+from tests.converter_fixtures import _source
 from tests.tokenizer_fixtures import save_tokenizer_assets
 
 

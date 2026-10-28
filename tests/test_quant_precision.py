@@ -10,42 +10,9 @@ import onnxruntime as ort
 import pytest
 from onnx import TensorProto, helper, numpy_helper
 
+from tests.quantization_fixtures import source
+
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def source(tmp_path):
-    inputs = tmp_path / "input"
-    inputs.mkdir()
-    rng = np.random.default_rng(44)
-    graph = helper.make_graph(
-        [
-            helper.make_node("MatMul", ["x", "w1"], ["h"], name="projection1"),
-            helper.make_node("MatMul", ["h", "w2"], ["y"], name="projection2"),
-        ],
-        "precision",
-        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 64])],
-        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 32])],
-        [
-            numpy_helper.from_array(rng.normal(size=(64, 64)).astype(np.float32), "w1"),
-            numpy_helper.from_array(rng.normal(size=(64, 32)).astype(np.float32), "w2"),
-        ],
-    )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=10)
-    for name in ["decoder_init", "decoder_step"]:
-        onnx.save(model, inputs / f"{name}.onnx")
-    (inputs / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": "qwen3_asr",
-                "decoder": {"vocab_size": 4, "hidden_size": 64},
-                "embed_tokens_shape": [4, 64],
-                "embed_tokens_dtype": "float32",
-            }
-        )
-    )
-    calib = tmp_path / "calib.npz"
-    np.savez(calib, _n_samples=40, **{f"{i}_x": rng.normal(size=(2, 64)).astype(np.float32) for i in range(40)})
-    return inputs, calib
 
 
 @pytest.mark.parametrize("algo", ["rtn", "gptq"])
@@ -262,7 +229,7 @@ def _relocate_split_weights(output, name):
 
 
 def test_split_source_closure_cannot_replace_retained_graph(tmp_path, split_algorithm):
-    from tests.test_artifact_contract import _write_external_identity
+    from tests.artifact_fixtures import _write_external_identity
 
     inputs, output = _split_output(tmp_path, algo=split_algorithm)
     _write_external_identity(inputs, "encoder.onnx", "decoder_init.int4.onnx")
@@ -453,7 +420,7 @@ def test_quantization_replaces_stale_output_template(tmp_path):
 @pytest.mark.parametrize("inplace", [False, True])
 @pytest.mark.parametrize("name", ["encoder", "custom_projection"])
 def test_quantize_safe_model_leaf_real_command(tmp_path, name, inplace):
-    from tests.test_artifact_contract import _write_model
+    from tests.artifact_fixtures import _write_model
 
     source = tmp_path / "input"
     source.mkdir()

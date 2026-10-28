@@ -16,7 +16,7 @@ from src.calibration_cache import (
     tokenizer_fingerprint,
     unpack_samples,
 )
-from tests.test_artifact_contract import _release_input, _write_model
+from tests.artifact_fixtures import _release_input, _write_model
 
 
 def _identity(tmp_path):
