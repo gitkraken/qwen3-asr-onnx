@@ -6,8 +6,13 @@ import onnxruntime as ort
 
 from src.artifact_metadata import MODEL_METADATA_FILES
 from src.embeddings import load_embed_tokens
-from src.onnx_artifacts import graph_file_closure
-from src.tokenizer_assets import tokenizer_asset_names, validate_tokenizer_assets
+from src.onnx_artifacts import transport_graph_files
+from src.tokenizer_assets import (
+    tokenizer_asset_changes,
+    tokenizer_asset_names,
+    validate_processor_template,
+    validate_tokenizer_assets,
+)
 
 REQUIRED_METADATA = [*MODEL_METADATA_FILES, "tokenizer.json", "tokenizer_config.json"]
 
@@ -30,7 +35,7 @@ def validate_release_metadata(root):
     validate_tokenizer_assets(root)
 
 
-def validate_release(root, selected_graphs):
+def validate_release(root, selected_graphs, *, tokenizer_root=None):
     root = Path(root).resolve()
     names = set(selected_graphs)
     if any(Path(name).name != name for name in names):
@@ -45,9 +50,11 @@ def validate_release(root, selected_graphs):
     if not expected or names != expected:
         raise ValueError("A release requires complete encoder, decoder_init and decoder_step graph sets")
     validate_release_metadata(root)
+    tokenizer_root = root if tokenizer_root is None else Path(tokenizer_root)
+    validate_processor_template(tokenizer_root)
     load_embed_tokens(root)
-    members = {*REQUIRED_METADATA, "embed_tokens.bin", *tokenizer_asset_names(root)}
-    members.update(graph_file_closure(root, names))
+    members = {*MODEL_METADATA_FILES, "embed_tokens.bin", *tokenizer_asset_names(tokenizer_root)}
+    members.update(transport_graph_files(root, names, rewritten=tokenizer_asset_changes(root, tokenizer_root)))
     options = ort.SessionOptions()
     options.log_severity_level = 3
     options.intra_op_num_threads = 1

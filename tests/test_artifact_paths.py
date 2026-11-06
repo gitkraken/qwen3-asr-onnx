@@ -56,11 +56,11 @@ def test_nested_output_cannot_overwrite_selected_source_storage(tmp_path, script
     source = input_for(tmp_path, script)
     target = source / "out"
     target.mkdir()
-    stem = "encoder" if script == "quantize.py" else "decoder_init"
+    stem = "decoder_init"
     generated = f"{stem}.int8.onnx.data" if script == "quantize.py" else f"{stem}.onnx"
     if script == "quantize_nbits.py":
         generated = f"{stem}.int4.onnx"
-    weight = np.ones((64, 64) if script == "quantize_nbits.py" else (4, 3), dtype=np.float32)
+    weight = np.ones((64, 64) if script in {"quantize_nbits.py", "quantize.py"} else (4, 3), dtype=np.float32)
     _write_model(source, f"{stem}.onnx", external=True, data_name=f"out/{generated}", weight=weight)
     before = bytes_under(source)
     expected = _ort_result(source / f"{stem}.onnx")
@@ -69,6 +69,33 @@ def test_nested_output_cannot_overwrite_selected_source_storage(tmp_path, script
     assert "source graph destination conflict" in result.stdout + result.stderr
     assert bytes_under(source) == before
     np.testing.assert_array_equal(_ort_result(source / f"{stem}.onnx"), expected)
+
+
+@pytest.mark.parametrize("stem", ["encoder", "decoder_step"])
+def test_nested_inline_output_preserves_selected_source_storage(tmp_path, stem):
+    script = "quantize.py"
+    source = input_for(tmp_path, script)
+    target = source / "out"
+    target.mkdir()
+    storage = f"{stem}.int8.onnx.data"
+    _write_model(
+        source,
+        f"{stem}.onnx",
+        external=True,
+        data_name=f"out/{storage}",
+        weight=np.ones((4, 3), dtype=np.float32),
+    )
+    _write_external_identity(target, "aux.onnx", storage)
+    before = bytes_under(source)
+    expected = _ort_result(source / f"{stem}.onnx")
+    retained = _ort_result(target / "aux.onnx")
+    result = subprocess.run(command(tmp_path, script, source, target), capture_output=True, text=True, timeout=90)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert all((source / name).read_bytes() == value for name, value in before.items())
+    assert not onnx_artifacts.external_data_files(target / f"{stem}.int8.onnx")
+    np.testing.assert_array_equal(_ort_result(source / f"{stem}.onnx"), expected)
+    np.testing.assert_array_equal(_ort_result(target / "aux.onnx"), retained)
+    np.testing.assert_allclose(_ort_result(target / f"{stem}.int8.onnx"), expected, atol=0.03, rtol=0.03)
 
 
 @pytest.mark.parametrize("script", SCRIPTS)

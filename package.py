@@ -16,7 +16,7 @@ from src.embeddings import load_embed_tokens
 from src.onnx_artifacts import graph_file_closure, transport_graph_files
 from src.release_validation import REQUIRED_METADATA, validate_release, validate_release_metadata
 from src.release_validation import graph_names as _graph_names
-from src.tokenizer_assets import tokenizer_asset_names
+from src.tokenizer_assets import prepare_tokenizer_assets, tokenizer_asset_changes, tokenizer_asset_names
 
 
 def copy_file(src, dst, hardlink=False):
@@ -75,6 +75,18 @@ def _validate_archive_target(target, archive_root, variant):
 
 
 def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
+    output = Path(output_dir).absolute()
+    if output.is_symlink():
+        raise ValueError("Output cannot be a symlink")
+    if output.exists() and not output.is_dir():
+        raise ValueError(f"Output must be a directory: {output}")
+    with prepare_tokenizer_assets(input_dir, output) as tokenizer:
+        if tokenizer is None:
+            raise ValueError("Required tokenizer assets missing")
+        return _package_prepared(input_dir, output_dir, test_wavs_src, hardlink, tokenizer)
+
+
+def _package_prepared(input_dir, output_dir, test_wavs_src, hardlink, tokenizer):
     source = Path(input_dir).resolve()
     output = Path(output_dir).absolute()
     archives = {
@@ -116,6 +128,7 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
     rewritten.update(name for variant in variants for name in _graph_names(variant)[1:])
     if test_wavs_src is not None:
         rewritten.add("test_wavs/0.wav")
+    rewritten.update(tokenizer_asset_changes(source, tokenizer.root))
     graph_files = transport_graph_files(
         source,
         (name for variant in variants for name in _graph_names(variant)),
@@ -127,12 +140,12 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
         unaffected_graphs.extend(name for other in variants if other != variant for name in _graph_names(other))
         if canonical in graph_file_closure(source, unaffected_graphs):
             raise ValueError(f"ONNX transport destination conflict: {canonical}")
-    metadata = set(MODEL_METADATA_FILES) | tokenizer_asset_names(source)
-    read_names = metadata | graph_files | {"embed_tokens.bin"}
+    metadata = set(MODEL_METADATA_FILES) | tokenizer.names
+    read_names = set(MODEL_METADATA_FILES) | tokenizer_asset_names(source) | graph_files | {"embed_tokens.bin"}
     if sidecar.exists():
         read_names.add(sidecar.name)
     read_roots = {Path(input_dir).absolute(), source}
-    source_reads = {root / name for root in read_roots for name in read_names} | read_roots
+    source_reads = {root / name for root in read_roots for name in read_names} | read_roots | set(tokenizer.reads)
     if test_wavs_src is not None:
         source_reads.add(Path(test_wavs_src))
     validate_publication_sources(source_reads, files=archives.values(), directories=[output])
@@ -144,7 +157,8 @@ def _package(input_dir, output_dir, test_wavs_src=None, hardlink=False):
         names = set(metadata)
         names.update(graph_files)
         for name in sorted(names):
-            copy_file(source / name, release / name, hardlink=hardlink and name in metadata)
+            asset_root = tokenizer.root if name in tokenizer.names else source
+            copy_file(asset_root / name, release / name, hardlink=hardlink and name in metadata)
         embed.tofile(release / "embed_tokens.bin")
         config = json.loads((release / "config.json").read_text())
         config["embed_tokens_dtype"] = "float16"

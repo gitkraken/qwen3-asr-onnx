@@ -18,8 +18,10 @@ from pathlib import Path
 from huggingface_hub import HfApi
 
 from src.artifact_publication import ArtifactStaging
+from src.artifact_sources import validate_publication_sources
 from src.onnx_artifacts import inventory_graphs, validate_generated_destinations
 from src.release_validation import validate_release
+from src.tokenizer_assets import prepare_tokenizer_assets
 
 # Archives are built from release/ dirs (produced by package.py), which contain
 # the correct FP16 embed_tokens.bin and patched config.json.
@@ -85,12 +87,29 @@ def _archive_destination(source, output, name, members):
 
 
 def create_tar(archive, output_dir):
+    try:
+        with (
+            ArtifactStaging(prefix="qwen-archive-family-", dir=None) as family,
+            prepare_tokenizer_assets(archive["source_dir"], family.path) as tokenizer,
+        ):
+            if tokenizer is None:
+                raise ValueError("Required tokenizer assets missing")
+            return _create_prepared_tar(archive, output_dir, tokenizer)
+    except Exception as error:
+        print(f"  ERROR: Invalid release: {error}")
+        return None
+
+
+def _create_prepared_tar(archive, output_dir, tokenizer):
     name = archive["name"]
     source_dir = Path(archive["source_dir"]).resolve()
     graphs = {filename for filename in archive["files"] if filename.endswith(".onnx")}
     try:
-        all_files = validate_release(source_dir, graphs)
-        tar_path = _archive_destination(source_dir, output_dir, name, all_files)
+        all_files = validate_release(source_dir, graphs, tokenizer_root=tokenizer.root)
+        source_files = {filename for filename in all_files if (source_dir / filename).is_file()}
+        tar_path = _archive_destination(source_dir, output_dir, name, source_files)
+        original_reads = {Path(archive["source_dir"]) / filename for filename in source_files} | set(tokenizer.reads)
+        validate_publication_sources(original_reads, files=[tar_path])
     except Exception as error:
         print(f"  ERROR: Invalid release: {error}")
         return None
@@ -100,7 +119,8 @@ def create_tar(archive, output_dir):
             staged_tar = staging.path / tar_path.name
             with tarfile.open(staged_tar, "w:gz", compresslevel=1, dereference=True) as target:
                 for filename in sorted(all_files):
-                    target.add(source_dir / filename, arcname=f"{name}/{filename}", recursive=False)
+                    member_root = tokenizer.root if filename in tokenizer.names else source_dir
+                    target.add(member_root / filename, arcname=f"{name}/{filename}", recursive=False)
             os.replace(staged_tar, tar_path)
             staging.mark_complete()
     except (OSError, tarfile.TarError) as error:

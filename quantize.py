@@ -147,7 +147,7 @@ def _run_conversion(args, tokenizer):
         for name in ONNX_FILES
         if os.path.isfile(os.path.join(args.input, name))
     }
-    generated = generated_graphs | {f"{name}.data" for name in generated_graphs}
+    generated = generated_graphs
     retained_graphs, previous_quantization = retained_quantization(args.output, suffix, generated_graphs)
     files.discard("config.json")
     tokenizer_files = tokenizer.names if tokenizer else frozenset()
@@ -179,19 +179,21 @@ def _run_conversion(args, tokenizer):
     # Decoders: all ops (decoders have no Conv layers).
     suffix = f".{args.weight_type}"  # e.g. ".int8"
     print(f"Quantizing ONNX files (weight_type={args.weight_type})...")
-    for filename in ONNX_FILES:
-        input_path = os.path.join(args.input, filename)
-        if not os.path.exists(input_path):
-            print(f"  Skipping {filename} (not found)")
-            continue
+    generated = set()
+    with ArtifactStaging(prefix=".quantize-", dir=args.output) as stage:
+        replacements = []
+        for filename in ONNX_FILES:
+            input_path = os.path.join(args.input, filename)
+            if not os.path.exists(input_path):
+                print(f"  Skipping {filename} (not found)")
+                continue
 
-        # Output with suffix: encoder.int8.onnx, decoder_init.int8.onnx, etc.
-        base = filename.removesuffix(".onnx")
-        output_filename = f"{base}{suffix}.onnx"
-        encoder_only_matmul = ["MatMul"] if filename == "encoder.onnx" else None
-        # Only apply node exclusions to decoder files (encoder uses op_type filtering)
-        file_exclude = exclude_nodes if filename != "encoder.onnx" else None
-        with ArtifactStaging(prefix=".quantize-", dir=args.output) as stage:
+            # Output with suffix: encoder.int8.onnx, decoder_init.int8.onnx, etc.
+            base = filename.removesuffix(".onnx")
+            output_filename = f"{base}{suffix}.onnx"
+            encoder_only_matmul = ["MatMul"] if filename == "encoder.onnx" else None
+            # Only apply node exclusions to decoder files (encoder uses op_type filtering)
+            file_exclude = exclude_nodes if filename != "encoder.onnx" else None
             output_path = stage.path / output_filename
             quantize_onnx_file(
                 input_path,
@@ -212,11 +214,26 @@ def _run_conversion(args, tokenizer):
             if data - {stage.path / f"{output_filename}.data"}:
                 raise ValueError(f"Unexpected quantizer output dependencies: {output_filename}")
             onnx.checker.check_model(str(output_path))
-            publish_artifacts(
-                [(path, Path(args.output) / path.name) for path in sorted(data)]
-                + [(output_path, Path(args.output) / output_filename)]
-            )
-            stage.mark_complete()
+            staged_graph = output_path.with_suffix(".proto")
+            output_path.rename(staged_graph)
+            replacements.extend((path, Path(args.output) / path.name) for path in sorted(data))
+            replacements.append((staged_graph, Path(args.output) / output_filename))
+            generated.update({output_filename, *(path.name for path in data)})
+        files = preflight_artifact_mutations(
+            args.input,
+            args.output,
+            files,
+            generated=generated,
+            rewritten={"config.json"},
+            read_files={"config.json"} | (tokenizer.read_files if tokenizer else set()),
+            copied_assets=tokenizer_files,
+            asset_source=tokenizer.root if tokenizer else None,
+            removed=tokenizer.removed if tokenizer else (),
+            reads=ONNX_FILES,
+        )
+        if replacements:
+            publish_artifacts(replacements)
+        stage.mark_complete()
 
     # Copy non-quantized files (skip if input == output)
     if os.path.realpath(args.input) != os.path.realpath(args.output):

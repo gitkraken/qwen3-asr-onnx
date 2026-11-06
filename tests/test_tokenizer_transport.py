@@ -25,7 +25,14 @@ from tests.tokenizer_fixtures import OFFICIAL_CHAT_TEMPLATE, save_tokenizer_asse
 
 
 def _assert_source_assets(source, target):
-    assert tokenizer_asset_names(target) == tokenizer_asset_names(source)
+    expected_names = tokenizer_asset_names(source)
+    if not expected_names & {"chat_template.json", "chat_template.jinja"}:
+        expected_names.add("chat_template.json")
+        assert (
+            json.loads((target / "chat_template.json").read_text())["chat_template"]
+            == validate_tokenizer_assets(source).get_chat_template()
+        )
+    assert tokenizer_asset_names(target) == expected_names
     for name in tokenizer_asset_names(source):
         assert (target / name).read_bytes() == (source / name).read_bytes()
     tokenizer = validate_tokenizer_assets(target)

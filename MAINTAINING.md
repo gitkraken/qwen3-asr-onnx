@@ -147,8 +147,11 @@ conversion and archiving. Export keeps the selected ASR template in a self-conta
 family and removes stale legacy representations. Converters prepare an independent
 family before graph work. Families whose model configuration affects their reader
 are serialized with the resolved class, backend, settings and named templates;
-the selected template is also carried separately for the official ASR processor.
-deferred regex changes are disabled after the actual backend is materialized.
+the original processor template is carried separately with its own legacy JSON,
+root Jinja, then processor-config precedence. Embedded-only input gains a standalone
+processor companion. The same preparation owns package and direct-archive metadata; final release
+validation requires a usable standalone processor template. In-place completion
+only adds the missing companion. Deferred regex changes are disabled after the actual backend is materialized.
 Conflict checks compare those prepared bytes with incoming and retained graph
 storage, allowing identical bytes to be reused. Late publication preserves the
 initial distinction between newly written graphs and independent retained graphs.
