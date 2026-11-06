@@ -1,5 +1,6 @@
 import gc
 import inspect
+import traceback
 import weakref
 from contextlib import contextmanager
 
@@ -87,7 +88,8 @@ def test_obsolete_helper_dies_before_next_constructor(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("fusion", [False, True])
-def test_graph_owner_collects_real_wrapper_on_return(tmp_path, monkeypatch, fusion):
+@pytest.mark.parametrize("active_error", [False, True])
+def test_graph_owner_collects_real_wrapper_on_return(tmp_path, monkeypatch, fusion, active_error):
     path = tiny_graph(tmp_path, fusion=fusion)
     original = optimize_graphs.optimize_model
     references = []
@@ -99,16 +101,40 @@ def test_graph_owner_collects_real_wrapper_on_return(tmp_path, monkeypatch, fusi
 
     monkeypatch.setattr(optimize_graphs, "optimize_model", observed)
     with manual_gc():
-        optimize_graphs.optimize_graph(str(path), 2, 16)
+        if active_error:
+            try:
+                raise ValueError("caller context")
+            except ValueError as caller_error:
+                optimize_graphs.optimize_graph(str(path), 2, 16)
+                assert str(caller_error) == "caller context"
+                assert caller_error.__traceback__ is not None
+        else:
+            optimize_graphs.optimize_graph(str(path), 2, 16)
         assert len(references) == 1
         assert references[0]() is None
 
 
-@pytest.mark.parametrize("failure", ["before-return", "after-return", "chained", "checker"])
+def _assert_graph_diagnostics(error, reference):
+    assert reference() is not None
+    owner_locals = next(
+        frame.f_locals
+        for frame, _ in traceback.walk_tb(error.__traceback__)
+        if frame.f_code is optimize_graphs.optimize_graph.__code__
+    )
+    assert owner_locals["model"] is reference()
+    assert len(reference().model.graph.node) > 0
+
+
+@pytest.mark.parametrize("failure", ["before-return", "after-return", "chained", "checker", "abort"])
 def test_graph_errors_keep_wrapper_until_caller_releases_traceback(tmp_path, monkeypatch, failure):
     path = tiny_graph(tmp_path, fusion=failure == "checker")
     references = []
-    injected = RuntimeError("injected optimizer failure")
+
+    class OperationAborted(BaseException):
+        pass
+
+    error_type = OperationAborted if failure == "abort" else RuntimeError
+    injected = error_type("injected optimizer failure")
 
     def inner(model):
         raise ValueError("inner optimizer failure")
@@ -141,7 +167,7 @@ def test_graph_errors_keep_wrapper_until_caller_releases_traceback(tmp_path, mon
     else:
         monkeypatch.setattr(optimize_graphs, "_portable_rms_norms", failed)
     with manual_gc():
-        with pytest.raises(RuntimeError, match="injected optimizer failure") as caught:
+        with pytest.raises(error_type, match="injected optimizer failure") as caught:
             optimize_graphs.optimize_graph(str(path), 2, 16)
         assert caught.value is injected
         assert caught.value.__traceback__ is not None
@@ -149,11 +175,49 @@ def test_graph_errors_keep_wrapper_until_caller_releases_traceback(tmp_path, mon
             assert isinstance(caught.value.__cause__, ValueError)
             assert str(caught.value.__cause__) == "inner optimizer failure"
         assert len(references) == 1
-        assert (references[0]() is not None) == (failure != "checker")
+        assert references[0]() is not None
+        if failure != "before-return":
+            _assert_graph_diagnostics(caught.value, references[0])
         del caught
         injected = None
         gc.collect()
         assert references[0]() is None
+
+
+def test_graph_error_retry_collects_only_after_exception_release(tmp_path, monkeypatch):
+    paths = []
+    for name in ("a", "b", "c"):
+        directory = tmp_path / name
+        directory.mkdir()
+        paths.append(tiny_graph(directory, fusion=name == "a"))
+    original = optimize_graphs.optimize_model
+    checker = optimize_graphs.onnx.checker.check_model
+    references = []
+    injected = RuntimeError("checker failure")
+
+    def observed(*args, **kwargs):
+        model = original(*args, **kwargs)
+        references.append(weakref.ref(model))
+        return model
+
+    def failed_checker(*args):
+        raise injected
+
+    monkeypatch.setattr(optimize_graphs, "optimize_model", observed)
+    monkeypatch.setattr(optimize_graphs.onnx.checker, "check_model", failed_checker)
+    with manual_gc():
+        with pytest.raises(RuntimeError, match="checker failure") as caught:
+            optimize_graphs.optimize_graph(str(paths[0]), 2, 16)
+        _assert_graph_diagnostics(caught.value, references[0])
+        monkeypatch.setattr(optimize_graphs.onnx.checker, "check_model", checker)
+        optimize_graphs.optimize_graph(str(paths[1]), 2, 16)
+        _assert_graph_diagnostics(caught.value, references[0])
+        assert references[1]() is None
+        del caught
+        injected = None
+        optimize_graphs.optimize_graph(str(paths[2]), 2, 16)
+        assert len(references) == 3
+        assert all(reference() is None for reference in references)
 
 
 def test_resource_factory_preserves_real_gpt2_graph_and_options(tmp_path):

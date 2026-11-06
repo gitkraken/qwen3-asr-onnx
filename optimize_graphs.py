@@ -144,6 +144,7 @@ def optimize_graph(onnx_path: str, num_heads: int, hidden_size: int, use_externa
     """
     model = None
     model_proto = None
+    failed = False
     try:
         model_type = resource_model_type()
         basename = os.path.basename(onnx_path)
@@ -192,9 +193,13 @@ def optimize_graph(onnx_path: str, num_heads: int, hidden_size: int, use_externa
         reduction = nodes_before - nodes_after
         pct = (reduction / nodes_before * 100) if nodes_before > 0 else 0
         print(f"  Nodes: {nodes_before} -> {nodes_after} ({reduction} removed, {pct:.1f}% reduction)")
+    except BaseException:
+        failed = True
+        raise
     finally:
-        model = None
-        del model_proto
+        if not failed:
+            model = None
+            del model_proto
         gc.collect()
 
 
