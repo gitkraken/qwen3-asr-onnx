@@ -277,6 +277,17 @@ gates, and tests the measured candidate bytes in an isolated application before
 publishing. Keep previous content-addressed revisions for rollback. A CPU
 checkpoint check is not evidence for WebGPU behavior.
 
+## Optimizer resource lifetime
+
+The graph optimizer uses the pinned ONNX Runtime 1.31.0 GPT-2 implementation and
+its original fusion options. Its resource adapter collects obsolete symbolic
+shape helpers before allocating replacements and collects graph wrappers after
+each operation. Unsupported optimizer factory or inference APIs fail explicitly.
+Exception tracebacks and their diagnostic locals remain intact; a caller retaining
+an exception can therefore retain graph objects until that exception is released.
+This controls unreachable object lifetime, not the optimizer's live working set
+or memory retained by its caller, and does not guarantee a large-model peak.
+
 ## Focused upstream proposals
 
 Prepare small branches from the audited upstream base, grouping tests with the
