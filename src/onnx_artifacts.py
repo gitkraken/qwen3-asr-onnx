@@ -12,7 +12,7 @@ from google.protobuf.descriptor import FieldDescriptor
 from google.protobuf.message import DecodeError
 
 from src.artifact_publication import ArtifactStaging
-from src.artifact_sources import validate_publication_sources
+from src.artifact_sources import same_entry, validate_publication_sources
 
 
 def storage_tensors(message, initializer=False):
@@ -87,7 +87,7 @@ def inventory_graphs(root, exclude=()):
     exclude = set(exclude)
     for path in sorted(root.rglob("*.onnx")):
         name = path.relative_to(root).as_posix()
-        if name in exclude:
+        if any(same_entry(path, root / entry) for entry in exclude):
             continue
         if not path.is_file():
             continue
@@ -115,8 +115,14 @@ def inventory_graphs(root, exclude=()):
 
 
 def retained_quantization(output, suffix, generated, *, existing=None):
+    generated = set(generated)
     graphs = inventory_graphs(output, generated) if existing is None else existing
-    retained = {name for name in graphs if name.endswith(f"{suffix}.onnx")} - set(generated)
+    retained = {
+        name
+        for name in graphs
+        if name.endswith(f"{suffix}.onnx")
+        and not any(same_entry(Path(output) / name, Path(output) / selected) for selected in generated)
+    }
     config = Path(output) / "config.json"
     if not config.is_file():
         return retained, {}
@@ -217,10 +223,20 @@ def preflight_artifact_mutations(
             if source == output
             else (inventory_graphs(output, generated | copied_graphs) if output.is_dir() else {})
         )
-    surviving = existing.keys() - copied_graphs - generated
+    surviving = {
+        name
+        for name in existing
+        if not any(same_entry(output / name, output / replacement) for replacement in copied_graphs | generated)
+    }
     reserved = set(surviving) | set().union(*(existing[name] for name in surviving))
-    conflicts = reserved & (generated | rewritten | removed)
-    for name in files & reserved:
+    conflicts = {
+        name
+        for name in generated | rewritten | removed
+        if any(same_entry(output / name, output / retained) for retained in reserved)
+    }
+    for name in files.copy():
+        if not any(same_entry(output / name, output / retained) for retained in reserved):
+            continue
         original, retained = (asset_root if name in assets else source) / name, output / name
         if original.stat().st_size == retained.stat().st_size and file_digest(original) == file_digest(retained):
             files.remove(name)

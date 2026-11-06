@@ -46,6 +46,7 @@ from export import (
     copy_tokenizer,
     load_model,
     write_config,
+    write_preprocessor_config,
 )
 from src.calibration_cache import cache_key, load_cache, model_fingerprint, recipe, save_cache, tokenizer_fingerprint
 from src.decoder_wrapper import export_decoder_init, export_decoder_step
@@ -538,6 +539,7 @@ def main():
 
     print("\n=== Writing config ===")
     write_config(model, args.output)
+    write_preprocessor_config(args.output)
 
     print(f"\nExport complete. Output directory: {args.output}")
     print("Files:")

@@ -16,6 +16,7 @@ from pathlib import Path
 import onnx
 
 from src.artifact_publication import ArtifactStaging
+from src.artifact_sources import same_entry
 from src.onnx_artifacts import (
     copy_artifact_entry as copy_artifact_entry,
 )
@@ -139,7 +140,7 @@ def _live_data_files(root, excluded):
     return {
         root / dependency
         for name, dependencies in inventory.items()
-        if root / name not in excluded
+        if not any(same_entry(root / name, selected) for selected in excluded)
         for dependency in dependencies
     }
 
@@ -213,7 +214,7 @@ def share_external_models(model_dir, suffix=None):
     if already_shared:
         _validate_runtime_models(root, names)
         return True
-    conflicts = (live | old_files) & {root / name for name in names}
+    conflicts = {path for path in live | old_files if any(same_entry(path, root / name) for name in names)}
     if conflicts:
         raise ValueError(f"ONNX transport destination conflict: {', '.join(sorted(path.name for path in conflicts))}")
     # A process exit must not leave transient graphs inside the recursive consumer inventory.

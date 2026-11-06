@@ -1,4 +1,5 @@
 import copy
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +26,72 @@ def _awq_model():
     model.thinker.model.layers = torch.nn.ModuleList()
     model.config = SimpleNamespace(to_dict=lambda: {})
     return model
+
+
+@pytest.mark.parametrize("retained", [False, True])
+def test_awq_metadata_publication_preserves_release_and_retained_tensors(tmp_path, monkeypatch, retained):
+    from qwen_asr.core.transformers_backend.configuration_qwen3_asr import Qwen3ASRConfig
+
+    from src.release_validation import graph_names, validate_release
+
+    source, output = tmp_path / "checkpoint", tmp_path / "output"
+    save_tokenizer_assets(source)
+    if retained:
+        output.mkdir()
+        (output / "preprocessor_config.json").write_bytes(np.array([42], np.float32).tobytes())
+        _write_external_identity(output, "aux.onnx", "preprocessor_config.json")
+    model = _awq_model()
+    model.config = Qwen3ASRConfig()
+    model.config.thinker_config.text_config.vocab_size = 8
+    model.config.thinker_config.text_config.hidden_size = 4
+    model.config.thinker_config.text_config.rope_scaling = {}
+    monkeypatch.setattr(awq_smooth, "load_model", lambda *args, **kwargs: model)
+    monkeypatch.setattr(awq_smooth, "collect_activations", lambda *args, **kwargs: {"norm": torch.ones(4)})
+    monkeypatch.setattr(awq_smooth, "apply_smoothing", lambda *args: None)
+
+    def tiny_export(model, path, **kwargs):
+        export_onnx(
+            torch.nn.Identity(), (torch.ones(1, 4),), path, input_names=["x"], output_names=["y"], opset_version=17
+        )
+
+    for name in ("export_encoder", "export_decoder_init", "export_decoder_step"):
+        monkeypatch.setattr(awq_smooth, name, tiny_export)
+    monkeypatch.setattr(
+        sys, "argv", ["awq_smooth.py", "--model", str(source), "--output", str(output), "--n-samples", "1"]
+    )
+    if retained:
+        with pytest.raises(ValueError, match="retained graph"):
+            awq_smooth.main()
+        assert (output / "preprocessor_config.json").read_bytes() == np.array([42], np.float32).tobytes()
+        np.testing.assert_array_equal(_ort_result(output / "aux.onnx"), [42])
+        return
+    awq_smooth.main()
+    members = validate_release(output, graph_names())
+    assert "preprocessor_config.json" in members
+    preprocessing = json.loads((output / "preprocessor_config.json").read_text())
+    assert preprocessing["sampling_rate"] == 16000
+    assert preprocessing["feature_size"] == 128
+    for name in graph_names():
+        np.testing.assert_array_equal(_ort_result(output / name), np.ones((1, 4), np.float32))
+
+
+@pytest.mark.parametrize("entry", ["hardlink", "symlink"])
+def test_preprocessing_writer_replaces_entry_without_truncating_backing_file(tmp_path, entry):
+    from export import write_preprocessor_config
+
+    backing = tmp_path / "retained.data"
+    backing.write_bytes(np.array([42], np.float32).tobytes())
+    destination = tmp_path / "preprocessor_config.json"
+    if entry == "hardlink":
+        destination.hardlink_to(backing)
+    else:
+        destination.symlink_to(backing.name)
+    _write_external_identity(tmp_path, "aux.onnx", backing.name)
+    write_preprocessor_config(str(tmp_path))
+    assert backing.read_bytes() == np.array([42], np.float32).tobytes()
+    np.testing.assert_array_equal(_ort_result(tmp_path / "aux.onnx"), [42])
+    assert not destination.is_symlink()
+    assert json.loads(destination.read_text())["sampling_rate"] == 16000
 
 
 def test_static_legacy_cache_is_preserved_and_only_matching_cache_is_reused(tmp_path, monkeypatch):

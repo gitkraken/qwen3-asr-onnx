@@ -5,7 +5,7 @@ def _same_file(first, second):
     return first.exists() and second.exists() and first.samefile(second)
 
 
-def _same_entry(first, second):
+def same_entry(first, second):
     if not _same_file(first.parent, second.parent):
         return False
     if first.name == second.name:
@@ -18,7 +18,7 @@ def _same_entry(first, second):
 
 
 def _inside(path, directory):
-    return _same_entry(path, directory) or any(_same_file(parent, directory) for parent in path.parents)
+    return same_entry(path, directory) or any(_same_file(parent, directory) for parent in path.parents)
 
 
 def paths_overlap(first, second):
@@ -63,13 +63,13 @@ def validate_publication_sources(reads, *, files=(), directories=(), direct_rewr
         direct = Path(source).absolute()
         for path in _access_paths(source):
             for target, directory in targets:
-                conflict = _inside(path, target) if directory else _same_entry(path, target)
+                conflict = _inside(path, target) if directory else same_entry(path, target)
                 if conflict:
                     if (
                         not directory
-                        and _same_entry(path, direct)
-                        and _same_entry(target, direct)
-                        and any(_same_entry(target, entry) for entry in authorized)
+                        and same_entry(path, direct)
+                        and same_entry(target, direct)
+                        and any(same_entry(target, entry) for entry in authorized)
                     ):
                         continue
                     raise ValueError(f"Publication would replace a source access path: {source} through {target}")

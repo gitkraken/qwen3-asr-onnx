@@ -28,7 +28,7 @@ from src.artifact_publication import ArtifactStaging
 from src.artifact_sources import validate_publication_sources
 from src.decoder_wrapper import export_decoder_init, export_decoder_step
 from src.encoder_wrapper import export_encoder
-from src.onnx_artifacts import external_data_files
+from src.onnx_artifacts import external_data_files, preflight_artifact_mutations, write_artifact_json
 from src.prompt import (
     ASR_TEXT_TOKEN_ID,
     AUDIO_END_TOKEN_ID,
@@ -137,8 +137,9 @@ def write_preprocessor_config(output_dir: str):
     }
 
     output_path = os.path.join(output_dir, "preprocessor_config.json")
-    with open(output_path, "w") as f:
-        json.dump(config, f, indent=2)
+    root = Path(output_dir).resolve()
+    preflight_artifact_mutations(root, root, (), rewritten={"preprocessor_config.json"})
+    write_artifact_json(output_dir, "preprocessor_config.json", config)
     print(f"Preprocessor config saved to {output_path}")
 
 
