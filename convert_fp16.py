@@ -17,15 +17,18 @@ Usage:
 import argparse
 import json
 import os
+from pathlib import Path
 
 import onnx
 from onnxconverter_common import convert_float_to_float16
 
-from share_weights import share_external_models
+from share_weights import share_external_models, shared_data_requires_publication
 from src.artifact_metadata import MODEL_METADATA_FILES
+from src.artifact_publication import ArtifactStaging, publish_artifacts
 from src.onnx_artifacts import (
     copy_artifact_entry,
     preflight_artifact_mutations,
+    prepare_onnx_publication,
     write_artifact_json,
 )
 from src.tokenizer_assets import (
@@ -89,22 +92,21 @@ def main():
 
 def _run_conversion(args, tokenizer):
     converted = {name for name in args.files if os.path.isfile(os.path.join(args.input, name))}
-    generated = converted | {f"{name}.data" for name in converted}
+    generated = converted
     share_pair = {"decoder_init.onnx", "decoder_step.onnx"} <= converted and not args.no_share_weights
-    if share_pair:
-        generated.add("decoder_weights.data")
     files = {"embed_tokens.bin", *MODEL_METADATA_FILES}
     if os.path.isfile(os.path.join(args.input, "encoder.onnx")) and "encoder.onnx" not in converted:
         files.add("encoder.onnx")
     tokenizer_files = tokenizer.names if tokenizer else frozenset()
     files.difference_update(tokenizer_files)
+    original_reads = files | (tokenizer.read_files if tokenizer else set())
     files = preflight_artifact_mutations(
         args.input,
         args.output,
         files,
         generated=generated,
         rewritten={"config.json"},
-        read_files=tokenizer.read_files if tokenizer else (),
+        read_files=original_reads,
         copied_assets=tokenizer_files,
         asset_source=tokenizer.root if tokenizer else None,
         removed=tokenizer.removed if tokenizer else (),
@@ -113,17 +115,42 @@ def _run_conversion(args, tokenizer):
     os.makedirs(args.output, exist_ok=True)
 
     print("Converting ONNX files to FP16...")
-    for filename in args.files:
-        input_path = os.path.join(args.input, filename)
-        if not os.path.exists(input_path):
-            print(f"  Skipping {filename} (not found)")
-            continue
-        output_path = os.path.join(args.output, filename)
-        convert_model_fp16(input_path, output_path)
-
-    if share_pair:
-        print("\nSharing FP16 decoder weights...")
-        share_external_models(args.output)
+    with ArtifactStaging(prefix=".fp16-", dir=args.output) as stage:
+        for filename in args.files:
+            input_path = os.path.join(args.input, filename)
+            if not os.path.exists(input_path):
+                print(f"  Skipping {filename} (not found)")
+                continue
+            convert_model_fp16(input_path, str(stage.path / filename))
+        if share_pair:
+            print("\nSharing FP16 decoder weights...")
+            share_external_models(stage.path)
+        replacements, generated = prepare_onnx_publication(
+            stage.path, args.output, converted, shared_data={"decoder_weights.data"} if share_pair else ()
+        )
+        canonical = Path(args.output) / "decoder_weights.data"
+        if (
+            share_pair
+            and canonical.name in generated
+            and not shared_data_requires_publication(stage.path / canonical.name, canonical)
+        ):
+            generated.remove(canonical.name)
+            replacements = [(source, target) for source, target in replacements if target != canonical]
+        files = preflight_artifact_mutations(
+            args.input,
+            args.output,
+            files,
+            generated=generated,
+            rewritten={"config.json"},
+            read_files=original_reads,
+            copied_assets=tokenizer_files,
+            asset_source=tokenizer.root if tokenizer else None,
+            removed=tokenizer.removed if tokenizer else (),
+            reads=converted,
+        )
+        if replacements:
+            publish_artifacts(replacements)
+        stage.mark_complete()
 
     # Copy non-converted files
     print("\nCopying supporting files...")

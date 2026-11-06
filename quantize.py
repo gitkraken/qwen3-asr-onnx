@@ -27,6 +27,7 @@ from src.onnx_artifacts import (
     external_data_files,
     isolated_onnx_input,
     preflight_artifact_mutations,
+    prepare_onnx_publication,
     retained_quantization,
     write_artifact_json,
 )
@@ -150,6 +151,7 @@ def _run_conversion(args, tokenizer):
     generated = generated_graphs
     retained_graphs, previous_quantization = retained_quantization(args.output, suffix, generated_graphs)
     files.discard("config.json")
+    original_reads = files | {"config.json"} | (tokenizer.read_files if tokenizer else set())
     tokenizer_files = tokenizer.names if tokenizer else frozenset()
     files = preflight_artifact_mutations(
         args.input,
@@ -157,7 +159,7 @@ def _run_conversion(args, tokenizer):
         files,
         generated=generated,
         rewritten={"config.json"},
-        read_files={"config.json"} | (tokenizer.read_files if tokenizer else set()),
+        read_files=original_reads,
         copied_assets=tokenizer_files,
         asset_source=tokenizer.root if tokenizer else None,
         removed=tokenizer.removed if tokenizer else (),
@@ -179,9 +181,7 @@ def _run_conversion(args, tokenizer):
     # Decoders: all ops (decoders have no Conv layers).
     suffix = f".{args.weight_type}"  # e.g. ".int8"
     print(f"Quantizing ONNX files (weight_type={args.weight_type})...")
-    generated = set()
     with ArtifactStaging(prefix=".quantize-", dir=args.output) as stage:
-        replacements = []
         for filename in ONNX_FILES:
             input_path = os.path.join(args.input, filename)
             if not os.path.exists(input_path):
@@ -210,22 +210,14 @@ def _run_conversion(args, tokenizer):
                 print(f"  Inlining {output_filename} weights into .onnx proto...")
                 model = onnx.load(output_path, load_external_data=True)
                 onnx.save(model, output_path)
-            data = external_data_files(output_path)
-            if data - {stage.path / f"{output_filename}.data"}:
-                raise ValueError(f"Unexpected quantizer output dependencies: {output_filename}")
-            onnx.checker.check_model(str(output_path))
-            staged_graph = output_path.with_suffix(".proto")
-            output_path.rename(staged_graph)
-            replacements.extend((path, Path(args.output) / path.name) for path in sorted(data))
-            replacements.append((staged_graph, Path(args.output) / output_filename))
-            generated.update({output_filename, *(path.name for path in data)})
+        replacements, generated = prepare_onnx_publication(stage.path, args.output, generated_graphs)
         files = preflight_artifact_mutations(
             args.input,
             args.output,
             files,
             generated=generated,
             rewritten={"config.json"},
-            read_files={"config.json"} | (tokenizer.read_files if tokenizer else set()),
+            read_files=original_reads,
             copied_assets=tokenizer_files,
             asset_source=tokenizer.root if tokenizer else None,
             removed=tokenizer.removed if tokenizer else (),

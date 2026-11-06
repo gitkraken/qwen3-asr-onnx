@@ -129,6 +129,28 @@ def retained_quantization(output, suffix, generated, *, existing=None):
     return retained, tags
 
 
+def prepare_onnx_publication(stage, output, graphs, *, shared_data=()):
+    stage, output = Path(stage).absolute(), Path(output)
+    graphs = set(graphs)
+    data = set()
+    replacements = []
+    for name in sorted(graphs):
+        path = stage / name
+        dependencies = external_data_files(path)
+        allowed = {stage / f"{name}.data", *(stage / name for name in shared_data)}
+        if dependencies - allowed:
+            raise ValueError(f"Unexpected converter output dependencies: {name}")
+        onnx.checker.check_model(str(path))
+        data.update(dependencies)
+        private = path.with_suffix(".proto")
+        path.rename(private)
+        replacements.append((private, output / name))
+    return (
+        [(path, output / path.name) for path in sorted(data)] + replacements,
+        graphs | {path.name for path in data},
+    )
+
+
 def preflight_artifact_mutations(
     source,
     output,
@@ -150,12 +172,8 @@ def preflight_artifact_mutations(
     validate_generated_destinations(destination_root, generated)
     assets = set(copied_assets)
     asset_root = source if asset_source is None else Path(asset_source)
-    files = (
-        {name for name in copies if (source / name).is_file()}
-        | {name for name in assets if (asset_root / name).is_file()}
-        if source != output
-        else set()
-    )
+    copy_reads = {name for name in copies if (source / name).is_file()}
+    files = copy_reads | {name for name in assets if (asset_root / name).is_file()} if source != output else set()
     incoming = inventory_graphs(source, set(generated) - set(reads) if source == output else ())
     copied_graphs = files & incoming.keys()
     dependencies = set().union(*(incoming[name] for name in copied_graphs))
@@ -164,24 +182,26 @@ def preflight_artifact_mutations(
     selected_reads = copied_graphs | {name for name in reads if (source / name).is_file()}
     source_graphs = {source / name for name in selected_reads}
     source_dependencies = set().union(*(external_data_files(path) for path in source_graphs))
+    source_entries = source_graphs | {
+        source / name for name in files | copy_reads | set(read_files) if (source / name).is_file()
+    }
     if source == output:
         protected_source = source_dependencies
         source_mutations = generated | rewritten | removed
     else:
-        source_entries = source_graphs | {
-            source / name for name in files | set(read_files) if (source / name).is_file()
-        }
         protected_source = source_dependencies | source_entries | {path.resolve() for path in source_entries}
         source_mutations = files | generated | rewritten | removed | assets
     source_conflicts = {name for name in source_mutations if output / name in protected_source}
     if source_conflicts:
         raise ValueError(f"ONNX source graph destination conflict: {', '.join(sorted(source_conflicts))}")
-    if source != output:
-        source_reads = source_entries | source_dependencies
-        validate_publication_sources(
-            [*source_reads, *(source_root / path.relative_to(source) for path in source_reads)],
-            files=(destination_root / name for name in source_mutations),
-        )
+    source_reads = source_entries | source_dependencies
+    validate_publication_sources(
+        [*source_reads, *(source_root / path.relative_to(source) for path in source_reads)],
+        files=(destination_root / name for name in source_mutations),
+        direct_rewrites=(
+            [destination_root / name for name in (generated & selected_reads) | rewritten] if source == output else ()
+        ),
+    )
     conflicts = (files & generated) | (dependencies & (rewritten | removed))
     for name in dependencies & assets:
         if file_digest(source / name) != file_digest(asset_root / name):

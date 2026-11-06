@@ -39,8 +39,9 @@ from onnxruntime.quantization import (
     quantize_static,
 )
 
-from share_weights import share_external_models
+from share_weights import share_external_models, shared_data_requires_publication
 from src.artifact_metadata import MODEL_METADATA_FILES
+from src.artifact_publication import ArtifactStaging, publish_artifacts
 from src.calibration_cache import (
     cache_key,
     file_fingerprints,
@@ -55,6 +56,7 @@ from src.onnx_artifacts import (
     graph_file_closure,
     isolated_onnx_input,
     preflight_artifact_mutations,
+    prepare_onnx_publication,
     write_artifact_json,
 )
 from src.tokenizer_assets import (
@@ -365,22 +367,21 @@ def _run_conversion(args, tokenizer):
         for stem in ("decoder_init", "decoder_step")
         if os.path.isfile(os.path.join(args.input, f"{stem}.onnx"))
     }
-    generated = converted | {f"{name}.data" for name in converted}
+    generated = converted
     share_pair = {"decoder_init.onnx", "decoder_step.onnx"} <= converted and not args.no_share_weights
-    if share_pair:
-        generated.add("decoder_weights.data")
     files = {"embed_tokens.bin", *MODEL_METADATA_FILES}
     if os.path.isfile(os.path.join(args.input, "encoder.onnx")):
         files.add("encoder.onnx")
     tokenizer_files = tokenizer.names if tokenizer else frozenset()
     files.difference_update(tokenizer_files)
+    original_reads = files | (tokenizer.read_files if tokenizer else set())
     files = preflight_artifact_mutations(
         args.input,
         args.output,
         files,
         generated=generated,
         rewritten={"config.json"},
-        read_files=tokenizer.read_files if tokenizer else (),
+        read_files=original_reads,
         copied_assets=tokenizer_files,
         asset_source=tokenizer.root if tokenizer else None,
         removed=tokenizer.removed if tokenizer else (),
@@ -423,35 +424,61 @@ def _run_conversion(args, tokenizer):
         if cache_path is not None:
             save_cache(cache_path, identity, pack_samples({"init": init_inputs, "step": step_inputs}))
 
-    # Quantize decoder_init
-    init_path = os.path.join(args.input, "decoder_init.onnx")
-    if os.path.exists(init_path):
-        quantize_decoder(
-            init_path,
-            os.path.join(args.output, "decoder_init.onnx"),
-            init_inputs,
-            calibrate_method=cal_method,
-            per_channel=args.per_channel,
-            nodes_to_exclude=exclude_nodes,
-            quant_format=quant_fmt,
-        )
+    with ArtifactStaging(prefix=".static-", dir=args.output) as stage:
+        init_path = os.path.join(args.input, "decoder_init.onnx")
+        if os.path.exists(init_path):
+            quantize_decoder(
+                init_path,
+                str(stage.path / "decoder_init.onnx"),
+                init_inputs,
+                calibrate_method=cal_method,
+                per_channel=args.per_channel,
+                nodes_to_exclude=exclude_nodes,
+                quant_format=quant_fmt,
+            )
 
-    # Quantize decoder_step
-    step_path = os.path.join(args.input, "decoder_step.onnx")
-    if os.path.exists(step_path):
-        quantize_decoder(
-            step_path,
-            os.path.join(args.output, "decoder_step.onnx"),
-            step_inputs,
-            calibrate_method=cal_method,
-            per_channel=args.per_channel,
-            nodes_to_exclude=exclude_nodes,
-            quant_format=quant_fmt,
-        )
+        step_path = os.path.join(args.input, "decoder_step.onnx")
+        if os.path.exists(step_path):
+            quantize_decoder(
+                step_path,
+                str(stage.path / "decoder_step.onnx"),
+                step_inputs,
+                calibrate_method=cal_method,
+                per_channel=args.per_channel,
+                nodes_to_exclude=exclude_nodes,
+                quant_format=quant_fmt,
+            )
 
-    if share_pair:
-        print("\nSharing quantized decoder weights...")
-        share_external_models(args.output)
+        if share_pair:
+            print("\nSharing quantized decoder weights...")
+            share_external_models(stage.path)
+
+        replacements, generated = prepare_onnx_publication(
+            stage.path, args.output, converted, shared_data={"decoder_weights.data"} if share_pair else ()
+        )
+        canonical = Path(args.output) / "decoder_weights.data"
+        if (
+            share_pair
+            and canonical.name in generated
+            and not shared_data_requires_publication(stage.path / canonical.name, canonical)
+        ):
+            generated.remove(canonical.name)
+            replacements = [(source, target) for source, target in replacements if target != canonical]
+        files = preflight_artifact_mutations(
+            args.input,
+            args.output,
+            files,
+            generated=generated,
+            rewritten={"config.json"},
+            read_files=original_reads,
+            copied_assets=tokenizer_files,
+            asset_source=tokenizer.root if tokenizer else None,
+            removed=tokenizer.removed if tokenizer else (),
+            reads=converted,
+        )
+        if replacements:
+            publish_artifacts(replacements)
+        stage.mark_complete()
 
     # Copy encoder and supporting files from input
     print("\nCopying supporting files...")

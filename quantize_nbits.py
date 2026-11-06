@@ -47,6 +47,7 @@ from onnxruntime.quantization.matmul_nbits_quantizer import (
 )
 from onnxruntime.quantization.quant_utils import QuantFormat
 
+from src.artifact_publication import ArtifactStaging, publish_artifacts
 from src.onnx_artifacts import (
     copy_artifact_entry,
     external_tensor_range,
@@ -54,6 +55,7 @@ from src.onnx_artifacts import (
     isolated_onnx_input,
     model_tensors,
     preflight_artifact_mutations,
+    prepare_onnx_publication,
     retained_quantization,
     validate_generated_destinations,
     validate_quantization_storage,
@@ -270,7 +272,7 @@ def _run_conversion(args, tokenizer):
     tokenizer_files = tokenizer.names if tokenizer else frozenset()
     bits_suffix = f".int{args.bits}"
     generated_graphs = {f"{name}{bits_suffix}.onnx" for name in args.decoders}
-    validate_generated_destinations(args.output, generated_graphs | {f"{name}.data" for name in generated_graphs})
+    validate_generated_destinations(args.output, generated_graphs)
     existing_graphs = inventory_graphs(args.output, generated_graphs)
     retained_graphs, previous_quantization = retained_quantization(
         args.output, bits_suffix, generated_graphs, existing=existing_graphs
@@ -286,15 +288,16 @@ def _run_conversion(args, tokenizer):
         and fname not in excluded_files
         and os.path.isfile(os.path.join(args.input, fname))
     }
-    generated = generated_graphs | {f"{name}.data" for name in generated_graphs}
+    generated = generated_graphs
     files.discard("config.json")
+    original_reads = files | {"config.json"} | (tokenizer.read_files if tokenizer else set())
     files = preflight_artifact_mutations(
         args.input,
         args.output,
         files,
         generated=generated,
         rewritten={"config.json"},
-        read_files={"config.json"} | (tokenizer.read_files if tokenizer else set()),
+        read_files=original_reads,
         copied_assets=tokenizer_files,
         asset_source=tokenizer.root if tokenizer else None,
         removed=tokenizer.removed if tokenizer else (),
@@ -303,15 +306,39 @@ def _run_conversion(args, tokenizer):
     )
     os.makedirs(args.output, exist_ok=True)
 
-    # Quantize each decoder file
     quantized_names = set()
-    for name in args.decoders:
-        src = os.path.join(args.input, f"{name}.onnx")
-        dst = os.path.join(args.output, f"{name}{bits_suffix}.onnx")
-        quantize_decoder(
-            src, dst, args.bits, args.block_size, args.accuracy_level, args.algo, args.calib_data, args.nodes_to_exclude
+    with ArtifactStaging(prefix=".nbits-", dir=args.output) as stage:
+        for name in args.decoders:
+            src = os.path.join(args.input, f"{name}.onnx")
+            dst = str(stage.path / f"{name}{bits_suffix}.onnx")
+            quantize_decoder(
+                src,
+                dst,
+                args.bits,
+                args.block_size,
+                args.accuracy_level,
+                args.algo,
+                args.calib_data,
+                args.nodes_to_exclude,
+            )
+            quantized_names.add(name)
+        replacements, generated = prepare_onnx_publication(stage.path, args.output, generated_graphs)
+        files = preflight_artifact_mutations(
+            args.input,
+            args.output,
+            files,
+            generated=generated,
+            rewritten={"config.json"},
+            read_files=original_reads,
+            copied_assets=tokenizer_files,
+            asset_source=tokenizer.root if tokenizer else None,
+            removed=tokenizer.removed if tokenizer else (),
+            reads=[f"{name}.onnx" for name in args.decoders],
+            existing=existing_graphs,
         )
-        quantized_names.add(name)
+        if replacements:
+            publish_artifacts(replacements)
+        stage.mark_complete()
 
     # Copy non-quantized files from input to output (encoder, tokenizer, config, etc.)
     # Skip if input == output (in-place quantization).

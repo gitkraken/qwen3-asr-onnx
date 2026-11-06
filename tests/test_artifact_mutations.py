@@ -324,6 +324,7 @@ def test_source_reader_template_directory_rejected_without_publishing(tmp_path):
         ("package", ".package-"),
         ("tokenizer", ".tokenizer-"),
         ("archive", ".archive-"),
+        ("archive-family", "qwen-archive-family-"),
         ("sharing", ".share-"),
         ("copy", ".artifact-"),
         ("metadata", ".artifact-"),
@@ -371,6 +372,12 @@ def test_published_artifacts_survive_staging_cleanup_error(tmp_path, monkeypatch
                 "files": ["encoder.onnx", "decoder_init.onnx", "decoder_step.onnx"],
             }
             assert create_tar(spec, str(tmp_path)) == str(tmp_path / "bundle.tar.gz")
+            import tarfile
+
+            with tarfile.open(tmp_path / "bundle.tar.gz") as archive:
+                config = archive.extractfile("bundle/config.json")
+                assert config is not None
+                assert json.load(config)["embed_tokens_dtype"] == "float32"
     output = capsys.readouterr().out
     assert "Publication completed; staging cleanup" in output
     assert leftovers and all(str(path) in output for path in leftovers)

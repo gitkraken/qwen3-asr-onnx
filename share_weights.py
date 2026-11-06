@@ -144,9 +144,10 @@ def _live_data_files(root, excluded):
     }
 
 
-def _publish_data(staged, target):
+def shared_data_requires_publication(staged, target):
     if target.is_symlink():
         raise ValueError("Canonical shared data cannot be a symlink; rebuild in a clean output directory")
+    validate_generated_destinations(target.parent, [target.name])
     if target.exists():
         identical = (
             target.is_file()
@@ -154,9 +155,14 @@ def _publish_data(staged, target):
             and file_digest(staged) == file_digest(target)
         )
         if identical:
-            return
+            return False
         raise ValueError("Canonical shared data has incompatible bytes; rebuild in a clean output directory")
-    os.replace(staged, target)
+    return True
+
+
+def _publish_data(staged, target):
+    if shared_data_requires_publication(staged, target):
+        os.replace(staged, target)
 
 
 def _validate_models(root, names):

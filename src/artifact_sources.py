@@ -55,12 +55,21 @@ def _destination_entry(path):
     return path.parent.resolve() / path.name
 
 
-def validate_publication_sources(reads, *, files=(), directories=()):
+def validate_publication_sources(reads, *, files=(), directories=(), direct_rewrites=()):
     targets = [(_destination_entry(path), False) for path in files]
     targets.extend((_destination_entry(path), True) for path in directories)
+    authorized = [_destination_entry(path) for path in direct_rewrites]
     for source in reads:
+        direct = Path(source).absolute()
         for path in _access_paths(source):
             for target, directory in targets:
                 conflict = _inside(path, target) if directory else _same_entry(path, target)
                 if conflict:
+                    if (
+                        not directory
+                        and _same_entry(path, direct)
+                        and _same_entry(target, direct)
+                        and any(_same_entry(target, entry) for entry in authorized)
+                    ):
+                        continue
                     raise ValueError(f"Publication would replace a source access path: {source} through {target}")

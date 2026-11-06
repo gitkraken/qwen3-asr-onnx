@@ -94,7 +94,10 @@ def create_tar(archive, output_dir):
         ):
             if tokenizer is None:
                 raise ValueError("Required tokenizer assets missing")
-            return _create_prepared_tar(archive, output_dir, tokenizer)
+            result = _create_prepared_tar(archive, output_dir, tokenizer)
+            if result is not None:
+                family.mark_complete()
+            return result
     except Exception as error:
         print(f"  ERROR: Invalid release: {error}")
         return None

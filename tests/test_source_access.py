@@ -20,6 +20,24 @@ class SourceAccessTests(unittest.TestCase):
         validate_publication_sources([source], files=[target])
         self.assertEqual(source.read_bytes(), b"source")
 
+    def test_direct_rewrite_requires_explicit_entry_authority(self):
+        source = self.root / "source"
+        source.write_bytes(b"source")
+        with self.assertRaisesRegex(ValueError, "source access path"):
+            validate_publication_sources([source], files=[source])
+        validate_publication_sources([source], files=[source], direct_rewrites=[source])
+
+    @unittest.skipIf(os.name == "nt", "Uses POSIX symlinks; junction tests cover Windows")
+    def test_direct_rewrite_does_not_authorize_another_readers_backing_entry(self):
+        source, reader = self.root / "source", self.root / "reader"
+        source.write_bytes(b"source")
+        reader.symlink_to(source)
+        with self.assertRaisesRegex(ValueError, "source access path"):
+            validate_publication_sources([source, reader], files=[source], direct_rewrites=[source])
+        with self.assertRaisesRegex(ValueError, "source access path"):
+            validate_publication_sources([reader], files=[source, reader], direct_rewrites=[reader])
+        validate_publication_sources([reader], files=[reader], direct_rewrites=[reader])
+
     def test_replacing_distinct_hardlink_entry_is_allowed(self):
         source, target = self.root / "source", self.root / "target"
         source.write_bytes(b"source")

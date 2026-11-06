@@ -12,6 +12,7 @@ import pytest
 
 import package as pack
 from tests.artifact_fixtures import _ort_result, _release_input, _write_external_identity, _write_model
+from tests.converter_fixtures import bytes_under
 from tests.tokenizer_fixtures import save_tokenizer_assets
 
 
@@ -277,18 +278,20 @@ def test_unusable_tokenizer_contract_preserves_previous_release(tmp_path, proble
         (source / "chat_template.jinja").write_text("{{ messages[0].content }}")
     else:
         (source / "tokenizer.json").write_text("{}")
-    from src import release_validation
+    from src import tokenizer_assets
 
-    validate = release_validation.validate_tokenizer_assets
+    original_source = bytes_under(source)
+    validate = tokenizer_assets.validate_tokenizer_assets
     reached = []
 
     def validate_and_record(root):
         reached.append(Path(root).name)
         return validate(root)
 
-    monkeypatch.setattr(release_validation, "validate_tokenizer_assets", validate_and_record)
+    monkeypatch.setattr(tokenizer_assets, "validate_tokenizer_assets", validate_and_record)
     assert not pack.package(str(source), str(output))
     assert reached == ["source"]
+    assert bytes_under(source) == original_source
     assert {p.relative_to(output): p.read_bytes() for p in output.rglob("*") if p.is_file()} == previous
     assert archive.read_bytes() == archive_bytes
 

@@ -98,6 +98,78 @@ def test_nested_inline_output_preserves_selected_source_storage(tmp_path, stem):
     np.testing.assert_allclose(_ort_result(target / f"{stem}.int8.onnx"), expected, atol=0.03, rtol=0.03)
 
 
+@pytest.mark.parametrize("reader", ["complete-tokenizer", "embedded-tokenizer", "config", "graph"])
+def test_inplace_conversion_preserves_original_indirect_read_routes(tmp_path, reader):
+    from src.tokenizer_assets import TOKENIZER_FILES, validate_tokenizer_assets
+
+    source = input_for(tmp_path, "quantize.py")
+    name = "tokenizer.json"
+    if reader == "complete-tokenizer":
+        config = json.loads((source / "tokenizer_config.json").read_text())
+        (source / "chat_template.json").write_text(json.dumps({"chat_template": config["chat_template"]}))
+    elif reader == "embedded-tokenizer":
+        for template in ("chat_template.json", "chat_template.jinja"):
+            (source / template).unlink(missing_ok=True)
+    elif reader == "config":
+        for asset in TOKENIZER_FILES:
+            (source / asset).unlink(missing_ok=True)
+        name = "config.json"
+    elif reader == "graph":
+        name = "decoder_init.onnx"
+    backing = source / "encoder.int8.onnx"
+    backing.write_bytes((source / name).read_bytes())
+    (source / name).unlink()
+    (source / name).symlink_to(backing.name)
+    before = bytes_under(source)
+    expected = _ort_result(source / "decoder_init.onnx")
+    for _ in range(2):
+        result = subprocess.run(
+            command(tmp_path, "quantize.py", source, source), capture_output=True, text=True, timeout=90
+        )
+        assert result.returncode != 0
+        assert bytes_under(source) == before
+        np.testing.assert_array_equal(_ort_result(source / "decoder_init.onnx"), expected)
+        if "tokenizer" in reader:
+            validate_tokenizer_assets(source)
+        elif reader == "config":
+            assert isinstance(json.loads((source / name).read_text()), dict)
+
+
+@pytest.mark.parametrize("script", ["convert_fp16.py", "quantize_static.py", "quantize_nbits.py"])
+def test_inline_converter_preserves_retained_potential_sidecar(tmp_path, script):
+    import onnx
+
+    source = input_for(tmp_path, script)
+    if script == "quantize_nbits.py":
+        for name in ("decoder_init.onnx", "decoder_step.onnx"):
+            _write_model(source, name, weight=np.arange(256, dtype=np.float32).reshape(64, 4) / 256)
+            model = onnx.load(source / name)
+            model.graph.node[0].name = "projection"
+            onnx.save(model, source / name)
+    target = tmp_path / "target"
+    target.mkdir()
+    graph = "decoder_init.int4.onnx" if script == "quantize_nbits.py" else "decoder_init.onnx"
+    data = target / f"{graph}.data"
+    data.write_bytes(np.array([42], np.float32).tobytes())
+    _write_external_identity(target, "aux.onnx", data.name)
+    before_source = bytes_under(source)
+    before_data, before_aux = data.read_bytes(), (target / "aux.onnx").read_bytes()
+    result = subprocess.run(command(tmp_path, script, source, target), capture_output=True, text=True, timeout=90)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert bytes_under(source) == before_source
+    assert data.read_bytes() == before_data
+    assert (target / "aux.onnx").read_bytes() == before_aux
+    np.testing.assert_array_equal(_ort_result(target / "aux.onnx"), [42])
+    assert not onnx_artifacts.external_data_files(target / graph)
+    reference = source / "decoder_init.onnx"
+    if script == "quantize_nbits.py":
+        import quantize_nbits
+
+        reference = tmp_path / "reference.onnx"
+        quantize_nbits.quantize_decoder(str(source / "decoder_init.onnx"), str(reference), 4, 32, None, "rtn", None)
+    np.testing.assert_allclose(_ort_result(target / graph), _ort_result(reference), atol=0.3, rtol=0.05)
+
+
 @pytest.mark.parametrize("script", SCRIPTS)
 def test_noncolliding_nested_output_can_be_rebuilt(tmp_path, script):
     source = input_for(tmp_path, script)
