@@ -10,8 +10,34 @@ from google.protobuf.message import DecodeError
 
 import package
 import share_weights
+from src.onnx_artifacts import preflight_artifact_mutations
 from tests.artifact_fixtures import _ort_result, _release_input, _write_external_identity, _write_model
 from tests.converter_fixtures import ROOT, SCRIPTS, _converter_command, bytes_under, command, input_for
+
+
+def test_preflight_preserves_original_dependencies_after_identical_copies_are_pruned(tmp_path):
+    source = tmp_path / "source"
+    target = source / "out"
+    target.mkdir(parents=True)
+    (target / "out").mkdir()
+    weights = np.array([42], dtype=np.float32).tobytes()
+    (target / "weights.data").write_bytes(weights)
+    (target / "out/weights.data").write_bytes(weights)
+    _write_external_identity(source, "aux.onnx", "out/weights.data")
+    (target / "aux.onnx").write_bytes((source / "aux.onnx").read_bytes())
+    _write_external_identity(target, "keeper-graph.onnx", "aux.onnx")
+    _write_external_identity(target, "keeper-weights.onnx", "out/weights.data")
+    before = bytes_under(source)
+
+    copies = preflight_artifact_mutations(source, target, {"aux.onnx"}, read_files={"aux.onnx"})
+    assert copies == set()
+    assert (
+        preflight_artifact_mutations(source, target, copies, generated={"unrelated.data"}, read_files={"aux.onnx"})
+        == set()
+    )
+    with pytest.raises(ValueError, match="source graph destination conflict"):
+        preflight_artifact_mutations(source, target, copies, generated={"weights.data"}, read_files={"aux.onnx"})
+    assert bytes_under(source) == before
 
 
 def test_package_preserves_source_metadata_referencing_output(tmp_path):

@@ -175,6 +175,7 @@ def preflight_artifact_mutations(
     destination_root = Path(output).absolute()
     source, output = Path(source).resolve(), destination_root.resolve()
     generated, rewritten, removed = set(generated), set(rewritten), set(removed)
+    read_files = set(read_files)
     validate_generated_destinations(destination_root, generated)
     assets = set(copied_assets)
     asset_root = source if asset_source is None else Path(asset_source)
@@ -186,10 +187,11 @@ def preflight_artifact_mutations(
     files.update(dependencies)
     validate_destination_parents(destination_root, files | generated | rewritten | removed | assets)
     selected_reads = copied_graphs | {name for name in reads if (source / name).is_file()}
-    source_graphs = {source / name for name in selected_reads}
+    protected_graphs = selected_reads | (read_files & incoming.keys())
+    source_graphs = {source / name for name in protected_graphs}
     source_dependencies = set().union(*(external_data_files(path) for path in source_graphs))
     source_entries = source_graphs | {
-        source / name for name in files | copy_reads | set(read_files) if (source / name).is_file()
+        source / name for name in files | copy_reads | read_files if (source / name).is_file()
     }
     if source == output:
         protected_source = source_dependencies
