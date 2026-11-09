@@ -137,7 +137,7 @@ Packages require complete graph sets plus their actual external-data references,
 configuration, tokenizer and embeddings. Inline, per-decoder and shared weights
 are alternatives. The release and archives are staged and validated before
 replacing a prior usable release. Every publication destination must be separate from the source. Existing emitted
-archives must be regular, recognizable model archives with the expected root and
+archives replaced by `package.py` must be regular, recognizable model archives with the expected root and
 required artifacts; inspection never extracts members or follows archive links.
 An archive for an inactive variant is preserved and causes a preflight error, so
 a successful release cannot leave an ambiguous stale variant beside it. Choose a
